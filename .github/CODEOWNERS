@@ -1,0 +1,11 @@
+# Default owner of every file in the repo.
+# Anything not matched by a more specific rule below falls here.
+*                       @colesmcintosh
+
+# Higher-risk paths called out explicitly so reviewers can't drift later.
+/.github/               @colesmcintosh
+/Dockerfile             @colesmcintosh
+/SECURITY.md            @colesmcintosh
+/LICENSE                @colesmcintosh
+/internal/auth/         @colesmcintosh
+/internal/store/        @colesmcintosh
