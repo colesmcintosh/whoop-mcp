@@ -1,5 +1,11 @@
 # whoop-mcp
 
+[![CI](https://github.com/colesmcintosh/whoop-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/colesmcintosh/whoop-mcp/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/colesmcintosh/whoop-mcp.svg)](https://pkg.go.dev/github.com/colesmcintosh/whoop-mcp)
+[![Go Report Card](https://goreportcard.com/badge/github.com/colesmcintosh/whoop-mcp)](https://goreportcard.com/report/github.com/colesmcintosh/whoop-mcp)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new/template?template=https://github.com/colesmcintosh/whoop-mcp)
+
 A [Model Context Protocol](https://modelcontextprotocol.io) server for the
 [Whoop API v2](https://developer.whoop.com/), written in Go.
 
@@ -69,20 +75,10 @@ Copy the **Client ID** and **Client Secret**.
 | `USER_STORE_DIR` | optional | Where per-user JSON token files live. Default `/data/users`. Put this on persistent storage. |
 | `PORT` *or* `MCP_HTTP_ADDR` | yes (HTTP mode) | Listening address. Platforms like Railway set `PORT`. |
 
-### 3. Deploy (Docker)
+### 3. Deploy
 
-```sh
-docker build -t whoop-mcp .
-docker run --rm -p 8080:8080 \
-  -e WHOOP_CLIENT_ID=... \
-  -e WHOOP_CLIENT_SECRET=... \
-  -e WHOOP_REDIRECT_URI=https://your.host/oauth/callback \
-  -e PUBLIC_URL=https://your.host \
-  -v whoop-data:/data \
-  whoop-mcp
-```
-
-### 3. Deploy (Railway)
+See [DEPLOY.md](./DEPLOY.md) for full step-by-step Railway and Docker
+instructions. Short version for Railway:
 
 ```sh
 railway login
@@ -94,7 +90,7 @@ railway add --service whoop-mcp \
   --variables "PUBLIC_URL=https://<your>.up.railway.app"
 railway volume add --mount-path /data
 railway up
-railway domain                # mints a public URL
+railway domain
 ```
 
 The included `Dockerfile` and `railway.toml` are picked up automatically.
