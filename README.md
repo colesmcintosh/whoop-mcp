@@ -2,7 +2,6 @@
 
 [![CI](https://github.com/colesmcintosh/whoop-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/colesmcintosh/whoop-mcp/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/colesmcintosh/whoop-mcp.svg)](https://pkg.go.dev/github.com/colesmcintosh/whoop-mcp)
-[![Go Report Card](https://goreportcard.com/badge/github.com/colesmcintosh/whoop-mcp)](https://goreportcard.com/report/github.com/colesmcintosh/whoop-mcp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 [![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new/template?template=https://github.com/colesmcintosh/whoop-mcp)
 
