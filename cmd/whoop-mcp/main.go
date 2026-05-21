@@ -81,38 +81,43 @@ func jsonResult(raw json.RawMessage) *mcp.CallToolResult {
 	}
 }
 
+// osExit is swappable so tests can invoke main() without terminating
+// the test process.
+var osExit = os.Exit
+
 func main() {
+	if err := run(context.Background()); err != nil {
+		fmt.Fprintln(os.Stderr, "whoop-mcp:", err)
+		osExit(1)
+	}
+}
+
+// run is the testable entry point. main is a thin wrapper that maps
+// errors to a non-zero exit status.
+func run(ctx context.Context) error {
 	cfg, err := auth.LoadConfigFromEnv()
 	if err != nil {
-		log.Fatalf("whoop-mcp: %v", err)
+		return err
 	}
 
 	if addr := httpListenAddr(); addr != "" {
-		if err := serveMultiTenant(context.Background(), addr, cfg); err != nil {
-			fmt.Fprintf(os.Stderr, "whoop-mcp: %v\n", err)
-			os.Exit(1)
-		}
-		return
+		return serveMultiTenant(ctx, addr, cfg)
 	}
 
 	// Stdio (single-tenant) mode.
 	if seed := os.Getenv("WHOOP_INITIAL_REFRESH_TOKEN"); seed != "" {
 		if err := auth.SeedRefreshTokenIfMissing(seed); err != nil {
-			log.Fatalf("whoop-mcp: seed token: %v", err)
+			return fmt.Errorf("seed token: %w", err)
 		}
 	}
-	ctx := context.Background()
 	src, err := cfg.TokenSource(ctx)
 	if err != nil {
-		log.Fatalf("whoop-mcp: %v", err)
+		return err
 	}
 	client := whoop.New(ctx, src)
 	s := newServer()
 	registerTools(s, client)
-	if err := s.Run(ctx, &mcp.StdioTransport{}); err != nil {
-		fmt.Fprintf(os.Stderr, "whoop-mcp: %v\n", err)
-		os.Exit(1)
-	}
+	return s.Run(ctx, &mcp.StdioTransport{})
 }
 
 func httpListenAddr() string {
@@ -181,12 +186,20 @@ func serveMultiTenant(ctx context.Context, addr string, cfg *auth.Config) error 
 }
 
 type app struct {
-	cfg       *auth.Config
-	store     *store.Store
-	publicURL string
-	oauth     *oauth2.Config
-	states    *stateStore
-	loginRL   *rateLimiter
+	cfg          *auth.Config
+	store        *store.Store
+	publicURL    string
+	oauth        *oauth2.Config
+	states       *stateStore
+	loginRL      *rateLimiter
+	whoopBaseURL string // injectable in tests; defaults to whoop.BaseURL
+}
+
+func (a *app) newWhoopClient(ctx context.Context, src oauth2.TokenSource) *whoop.Client {
+	if a.whoopBaseURL == "" {
+		return whoop.New(ctx, src)
+	}
+	return whoop.NewWithBaseURL(ctx, src, a.whoopBaseURL)
 }
 
 // securityHeaders applies a baseline of safe response headers.
@@ -293,9 +306,16 @@ func (s *stateStore) consume(v string) bool {
 	return true
 }
 
+// randReadMain and storeNewID are swappable in tests to exercise the
+// error paths that depend on crypto/rand and the store id generator.
+var (
+	randReadMain = rand.Read
+	storeNewID   = store.NewID
+)
+
 func randToken() (string, error) {
 	buf := make([]byte, 24)
-	if _, err := rand.Read(buf); err != nil {
+	if _, err := randReadMain(buf); err != nil {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(buf), nil
@@ -796,7 +816,7 @@ func (a *app) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	id, err := store.NewID()
+	id, err := storeNewID()
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -808,9 +828,13 @@ func (a *app) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	// Best-effort: fetch profile to label the record.
 	src := a.userTokenSource(rec)
-	client := whoop.New(ctx, src)
+	client := a.newWhoopClient(ctx, src)
 	if body, err := client.GetProfile(ctx); err == nil {
-		var p struct{ FirstName, LastName, Email string }
+		var p struct {
+			FirstName string `json:"first_name"`
+			LastName  string `json:"last_name"`
+			Email     string `json:"email"`
+		}
 		if json.Unmarshal(body, &p) == nil {
 			rec.UserName = strings.TrimSpace(p.FirstName + " " + p.LastName)
 			rec.UserEmail = p.Email
@@ -849,7 +873,7 @@ func (a *app) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	handler := mcp.NewStreamableHTTPHandler(func(_ *http.Request) *mcp.Server {
 		src := a.userTokenSource(rec)
-		client := whoop.New(r.Context(), src)
+		client := a.newWhoopClient(r.Context(), src)
 		s := newServer()
 		registerTools(s, client)
 		return s
@@ -886,7 +910,7 @@ func (a *app) handleDisconnect(w http.ResponseWriter, r *http.Request) {
 		_ = disconnectConfirmTpl.Execute(w, map[string]string{"ID": id, "Name": rec.UserName})
 	case http.MethodPost:
 		src := a.userTokenSource(rec)
-		client := whoop.New(r.Context(), src)
+		client := a.newWhoopClient(r.Context(), src)
 		revokeErr := client.RevokeAccess(r.Context())
 		// Delete the local record either way — if revoke failed, the
 		// user can finish revoking via Whoop's own account settings.

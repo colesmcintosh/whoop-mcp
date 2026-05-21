@@ -32,9 +32,15 @@ type Client struct {
 // authentication. The underlying http.Client automatically refreshes the
 // access token when it expires.
 func New(ctx context.Context, src oauth2.TokenSource) *Client {
+	return NewWithBaseURL(ctx, src, BaseURL)
+}
+
+// NewWithBaseURL is New with an overridden base URL. Used by tests to
+// point the client at an httptest fixture without mutating package vars.
+func NewWithBaseURL(ctx context.Context, src oauth2.TokenSource, baseURL string) *Client {
 	hc := oauth2.NewClient(ctx, src)
 	hc.Timeout = 30 * time.Second
-	return &Client{httpClient: hc, baseURL: BaseURL}
+	return &Client{httpClient: hc, baseURL: baseURL}
 }
 
 // APIError represents a non-2xx response from the Whoop API.

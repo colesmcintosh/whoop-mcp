@@ -1,9 +1,13 @@
 package auth
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/oauth2"
 )
@@ -56,6 +60,200 @@ func TestSaveLoadTokenRoundTrip(t *testing.T) {
 	}
 	if got.AccessToken != "a" || got.RefreshToken != "r" {
 		t.Fatalf("round-trip mismatch: %+v", got)
+	}
+}
+
+func TestOAuth2Config(t *testing.T) {
+	cfg := &Config{ClientID: "id", ClientSecret: "secret", RedirectURL: "http://localhost/cb"}
+	oc := cfg.OAuth2Config()
+	if oc.ClientID != "id" || oc.ClientSecret != "secret" {
+		t.Fatalf("credentials missing in oauth config: %+v", oc)
+	}
+	if oc.Endpoint.AuthURL != AuthURL || oc.Endpoint.TokenURL != TokenURL {
+		t.Fatalf("wrong endpoints: %+v", oc.Endpoint)
+	}
+	if len(oc.Scopes) == 0 {
+		t.Fatal("expected default scopes")
+	}
+}
+
+func TestTokenStorePathOverride(t *testing.T) {
+	t.Setenv("WHOOP_TOKEN_FILE", "/tmp/override.json")
+	got, err := TokenStorePath()
+	if err != nil {
+		t.Fatalf("TokenStorePath: %v", err)
+	}
+	if got != "/tmp/override.json" {
+		t.Fatalf("got %q, want override path", got)
+	}
+}
+
+func TestTokenStorePathDefaultsToUserConfigDir(t *testing.T) {
+	t.Setenv("WHOOP_TOKEN_FILE", "")
+	// Force os.UserConfigDir to succeed: just call and expect a non-empty path.
+	got, err := TokenStorePath()
+	if err != nil {
+		// In some sandboxed environments UserConfigDir may fail; that's the
+		// branch we're targeting in TestTokenStorePathUserConfigDirError.
+		t.Skip("UserConfigDir unavailable in this environment")
+	}
+	if !strings.HasSuffix(got, filepath.Join("whoop-mcp", "token.json")) {
+		t.Fatalf("unexpected path: %s", got)
+	}
+}
+
+func TestTokenStorePathUserConfigDirError(t *testing.T) {
+	t.Setenv("WHOOP_TOKEN_FILE", "")
+	orig := userConfigDir
+	t.Cleanup(func() { userConfigDir = orig })
+	userConfigDir = func() (string, error) { return "", errors.New("no config dir") }
+	if _, err := TokenStorePath(); err == nil {
+		t.Fatal("expected error from userConfigDir")
+	}
+}
+
+func TestSaveTokenPropagatesPathError(t *testing.T) {
+	t.Setenv("WHOOP_TOKEN_FILE", "")
+	orig := userConfigDir
+	t.Cleanup(func() { userConfigDir = orig })
+	userConfigDir = func() (string, error) { return "", errors.New("no config dir") }
+	if err := SaveToken(&oauth2.Token{RefreshToken: "r"}); err == nil {
+		t.Fatal("expected save error from path failure")
+	}
+}
+
+func TestSaveTokenPropagatesMarshalError(t *testing.T) {
+	withTempTokenFile(t)
+	orig := marshalIndent
+	t.Cleanup(func() { marshalIndent = orig })
+	marshalIndent = func(any, string, string) ([]byte, error) {
+		return nil, errors.New("marshal boom")
+	}
+	err := SaveToken(&oauth2.Token{RefreshToken: "r"})
+	if err == nil || !strings.Contains(err.Error(), "marshal boom") {
+		t.Fatalf("expected marshal error to surface, got %v", err)
+	}
+}
+
+func TestLoadTokenPropagatesPathError(t *testing.T) {
+	t.Setenv("WHOOP_TOKEN_FILE", "")
+	orig := userConfigDir
+	t.Cleanup(func() { userConfigDir = orig })
+	userConfigDir = func() (string, error) { return "", errors.New("no config dir") }
+	if _, err := LoadToken(); err == nil {
+		t.Fatal("expected load error from path failure")
+	}
+}
+
+func TestSaveTokenPropagatesMkdirError(t *testing.T) {
+	parent := t.TempDir()
+	if err := os.Chmod(parent, 0o500); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(parent, 0o700) })
+	t.Setenv("WHOOP_TOKEN_FILE", filepath.Join(parent, "nested", "token.json"))
+	if err := SaveToken(&oauth2.Token{RefreshToken: "r"}); err == nil {
+		t.Fatal("expected mkdir failure for read-only parent")
+	}
+}
+
+func TestLoadTokenParseError(t *testing.T) {
+	path := withTempTokenFile(t)
+	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+		t.Fatalf("write garbage: %v", err)
+	}
+	if _, err := LoadToken(); err == nil {
+		t.Fatal("expected parse error")
+	}
+}
+
+func TestExpiresIn(t *testing.T) {
+	if d := ExpiresIn(nil); d != 0 {
+		t.Fatalf("nil token: got %v, want 0", d)
+	}
+	if d := ExpiresIn(&oauth2.Token{}); d != 0 {
+		t.Fatalf("zero expiry: got %v, want 0", d)
+	}
+	future := time.Now().Add(time.Hour)
+	d := ExpiresIn(&oauth2.Token{Expiry: future})
+	if d <= 0 || d > time.Hour+time.Second {
+		t.Fatalf("expected ~1h, got %v", d)
+	}
+}
+
+// fakeTokenSource is a controllable oauth2.TokenSource.
+type fakeTokenSource struct {
+	tok *oauth2.Token
+	err error
+}
+
+func (f *fakeTokenSource) Token() (*oauth2.Token, error) { return f.tok, f.err }
+
+func TestConfigTokenSourceMissingToken(t *testing.T) {
+	withTempTokenFile(t) // path exists but empty/missing
+	cfg := &Config{ClientID: "id", ClientSecret: "s", RedirectURL: "http://l/cb"}
+	if _, err := cfg.TokenSource(context.Background()); err == nil {
+		t.Fatal("expected error when no token file exists")
+	}
+}
+
+func TestConfigTokenSourceSuccess(t *testing.T) {
+	withTempTokenFile(t)
+	if err := SaveToken(&oauth2.Token{AccessToken: "a", RefreshToken: "r", Expiry: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatalf("SaveToken: %v", err)
+	}
+	cfg := &Config{ClientID: "id", ClientSecret: "s", RedirectURL: "http://l/cb"}
+	src, err := cfg.TokenSource(context.Background())
+	if err != nil {
+		t.Fatalf("TokenSource: %v", err)
+	}
+	tok, err := src.Token()
+	if err != nil {
+		t.Fatalf("Token(): %v", err)
+	}
+	if tok.AccessToken != "a" {
+		t.Fatalf("unexpected token: %+v", tok)
+	}
+}
+
+func TestPersistingTokenSourceSavesOnRefresh(t *testing.T) {
+	path := withTempTokenFile(t)
+	fresh := &oauth2.Token{AccessToken: "new", RefreshToken: "r2"}
+	src := &persistingTokenSource{src: &fakeTokenSource{tok: fresh}}
+	tok, err := src.Token()
+	if err != nil {
+		t.Fatalf("Token: %v", err)
+	}
+	if tok != fresh {
+		t.Fatal("expected to return the underlying token unchanged")
+	}
+	loaded, err := LoadToken()
+	if err != nil {
+		t.Fatalf("LoadToken: %v", err)
+	}
+	if loaded.AccessToken != "new" {
+		t.Fatalf("token not persisted; loaded=%+v path=%s", loaded, path)
+	}
+}
+
+func TestPersistingTokenSourcePropagatesError(t *testing.T) {
+	src := &persistingTokenSource{src: &fakeTokenSource{err: errors.New("refresh failed")}}
+	if _, err := src.Token(); err == nil || !strings.Contains(err.Error(), "refresh failed") {
+		t.Fatalf("expected refresh error, got %v", err)
+	}
+}
+
+func TestPersistingTokenSourcePropagatesSaveError(t *testing.T) {
+	parent := t.TempDir()
+	t.Setenv("WHOOP_TOKEN_FILE", filepath.Join(parent, "nested", "token.json"))
+	if err := os.Chmod(parent, 0o500); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(parent, 0o700) })
+	fresh := &oauth2.Token{AccessToken: "new", RefreshToken: "r2"}
+	src := &persistingTokenSource{src: &fakeTokenSource{tok: fresh}}
+	if _, err := src.Token(); err == nil {
+		t.Fatal("expected save error to surface")
 	}
 }
 

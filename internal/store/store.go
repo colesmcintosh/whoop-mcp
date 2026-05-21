@@ -49,10 +49,22 @@ func New(dir string) (*Store, error) {
 	return &Store{dir: dir}, nil
 }
 
+// randRead and marshalIndent are swappable in tests to exercise the
+// crypto/rand and json.MarshalIndent error paths respectively.
+var (
+	randRead      = rand.Read
+	marshalIndent = json.MarshalIndent
+)
+
+// Dir returns the directory the store is rooted at. Exposed for tests
+// that need to manipulate the underlying files (e.g. to simulate I/O
+// errors by changing permissions).
+func (s *Store) Dir() string { return s.dir }
+
 // NewID returns a fresh random user id, suitable for use in URLs.
 func NewID() (string, error) {
 	buf := make([]byte, 24)
-	if _, err := rand.Read(buf); err != nil {
+	if _, err := randRead(buf); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(buf), nil
@@ -107,7 +119,7 @@ func (s *Store) Put(rec *Record) error {
 	if err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(rec, "", "  ")
+	data, err := marshalIndent(rec, "", "  ")
 	if err != nil {
 		return err
 	}

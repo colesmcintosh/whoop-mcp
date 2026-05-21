@@ -19,9 +19,25 @@ import (
 	"github.com/colesmcintosh/whoop-mcp/internal/auth"
 )
 
+// Swappable for tests:
+//   - logFatal lets a test capture the failure and avoid terminating
+//     the process.
+//   - openBrowserFn lets a test substitute a no-op for the real
+//     browser launch.
+//   - randRead is the source of randomness for the OAuth state value.
+//   - goos lets a test exercise every branch of openBrowser.
+//   - callbackTimeout shortens the OAuth wait window in tests.
+var (
+	logFatal        = log.Fatal
+	openBrowserFn   = openBrowser
+	randRead        = rand.Read
+	goos            = runtime.GOOS
+	callbackTimeout = 5 * time.Minute
+)
+
 func main() {
 	if err := run(); err != nil {
-		log.Fatal(err)
+		logFatal(err)
 	}
 }
 
@@ -100,9 +116,9 @@ func run() error {
 
 	fmt.Println("Opening browser to authorize Whoop access...")
 	fmt.Printf("If your browser doesn't open, visit:\n  %s\n\n", authURL)
-	_ = openBrowser(authURL)
+	_ = openBrowserFn(authURL)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), callbackTimeout)
 	defer cancel()
 
 	var code string
@@ -139,7 +155,7 @@ func run() error {
 
 func randomState() (string, error) {
 	buf := make([]byte, 24)
-	if _, err := rand.Read(buf); err != nil {
+	if _, err := randRead(buf); err != nil {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(buf), nil
@@ -147,7 +163,7 @@ func randomState() (string, error) {
 
 func openBrowser(target string) error {
 	var cmd *exec.Cmd
-	switch runtime.GOOS {
+	switch goos {
 	case "darwin":
 		cmd = exec.Command("open", target)
 	case "windows":

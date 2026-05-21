@@ -105,6 +105,129 @@ func TestDeleteIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestGetNonENOENTError(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "unreadable.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// Strip read permission so os.ReadFile fails with EACCES (not ENOENT).
+	if err := os.Chmod(filepath.Join(dir, "unreadable.json"), 0o000); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(filepath.Join(dir, "unreadable.json"), 0o600) })
+	_, err = s.Get("unreadable")
+	if err == nil {
+		t.Fatal("expected non-ENOENT read error")
+	}
+	if errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected real error, got ErrNotFound: %v", err)
+	}
+}
+
+func TestPutPropagatesMarshalError(t *testing.T) {
+	orig := marshalIndent
+	t.Cleanup(func() { marshalIndent = orig })
+	marshalIndent = func(any, string, string) ([]byte, error) {
+		return nil, errors.New("marshal blew up")
+	}
+	s := newTestStore(t)
+	err := s.Put(&Record{ID: "x"})
+	if err == nil || !strings.Contains(err.Error(), "marshal blew up") {
+		t.Fatalf("expected marshal error to propagate, got %v", err)
+	}
+}
+
+func TestDirReturnsConfiguredPath(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if got := s.Dir(); got != dir {
+		t.Fatalf("Dir() = %q, want %q", got, dir)
+	}
+}
+
+func TestNewIDPropagatesRandError(t *testing.T) {
+	orig := randRead
+	t.Cleanup(func() { randRead = orig })
+	randRead = func([]byte) (int, error) { return 0, errors.New("rand unavailable") }
+	if _, err := NewID(); err == nil {
+		t.Fatal("expected error when rand.Read fails")
+	}
+}
+
+func TestNewMkdirError(t *testing.T) {
+	parent := t.TempDir()
+	if err := os.Chmod(parent, 0o500); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(parent, 0o700) })
+	if _, err := New(filepath.Join(parent, "nested", "store")); err == nil {
+		t.Fatal("expected mkdir failure inside read-only parent")
+	}
+}
+
+func TestGetParseError(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "broken.json"), []byte("{not-json"), 0o600); err != nil {
+		t.Fatalf("write malformed: %v", err)
+	}
+	if _, err := s.Get("broken"); err == nil {
+		t.Fatal("expected parse error from malformed JSON")
+	}
+}
+
+func TestPutWriteError(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	// Make the store directory unwritable so the temp file write fails.
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	if err := s.Put(&Record{ID: "x", Token: &oauth2.Token{RefreshToken: "r"}}); err == nil {
+		t.Fatal("expected write failure inside read-only dir")
+	}
+}
+
+func TestDeleteRejectsInvalidID(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.Delete("../escape"); err == nil {
+		t.Fatal("expected error for invalid id")
+	}
+}
+
+func TestDeleteReturnsErrorOnUnwritableDir(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	rec := &Record{ID: "victim", Token: &oauth2.Token{RefreshToken: "r"}}
+	if err := s.Put(rec); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	if err := s.Delete("victim"); err == nil {
+		t.Fatal("expected delete error inside read-only dir")
+	}
+}
+
 func TestPutPermissionsAndAtomic(t *testing.T) {
 	dir := t.TempDir()
 	s, err := New(dir)

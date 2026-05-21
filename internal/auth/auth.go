@@ -13,8 +13,10 @@ import (
 	"golang.org/x/oauth2"
 )
 
-// Whoop OAuth 2.0 endpoints.
-const (
+// Whoop OAuth 2.0 endpoints. These are vars (not consts) so tests can
+// point them at an httptest fixture. In production they should not be
+// mutated.
+var (
 	AuthURL  = "https://api.prod.whoop.com/oauth/oauth2/auth"
 	TokenURL = "https://api.prod.whoop.com/oauth/oauth2/token"
 )
@@ -72,12 +74,19 @@ func (c *Config) OAuth2Config() *oauth2.Config {
 	}
 }
 
+// userConfigDir and marshalIndent are swappable in tests to exercise
+// the OS- and encoding-level error paths in TokenStorePath/SaveToken.
+var (
+	userConfigDir = os.UserConfigDir
+	marshalIndent = json.MarshalIndent
+)
+
 // TokenStorePath returns the path where the token is persisted.
 func TokenStorePath() (string, error) {
 	if override := os.Getenv("WHOOP_TOKEN_FILE"); override != "" {
 		return override, nil
 	}
-	dir, err := os.UserConfigDir()
+	dir, err := userConfigDir()
 	if err != nil {
 		return "", err
 	}
@@ -93,7 +102,7 @@ func SaveToken(tok *oauth2.Token) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(tok, "", "  ")
+	data, err := marshalIndent(tok, "", "  ")
 	if err != nil {
 		return err
 	}
