@@ -1,0 +1,8 @@
+bin/
+.env
+.env.*
+.git/
+*.md
+.railway-secrets
+.railwayignore
+Dockerfile.bak

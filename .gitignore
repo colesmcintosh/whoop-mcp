@@ -1,0 +1,6 @@
+/bin/
+.env
+.env.local
+*.test
+*.out
+.railway-secrets
