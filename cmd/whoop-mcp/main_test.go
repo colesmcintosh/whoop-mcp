@@ -226,9 +226,9 @@ func TestRateLimiterEvictsStale(t *testing.T) {
 
 func TestClientIPFromXForwardedFor(t *testing.T) {
 	cases := map[string]string{
-		"1.2.3.4":         "1.2.3.4",
+		"1.2.3.4":          "1.2.3.4",
 		"1.2.3.4, 5.6.7.8": "1.2.3.4",
-		"":                "",
+		"":                 "",
 	}
 	for xff, want := range cases {
 		r := httptest.NewRequest("GET", "/", nil)
