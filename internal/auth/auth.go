@@ -80,6 +80,7 @@ func (c *Config) OAuth2Config() *oauth2.Config {
 // Backend names a place where the stdio-mode OAuth token is persisted.
 type Backend string
 
+// Supported token backends, selected via WHOOP_TOKEN_BACKEND.
 const (
 	BackendFile    Backend = "file"
 	BackendKeyring Backend = "keyring"
