@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/colesmcintosh/whoop-mcp/internal/auth"
+	"golang.org/x/oauth2"
 )
 
 // Swappable for tests:
@@ -27,12 +28,19 @@ import (
 //   - randRead is the source of randomness for the OAuth state value.
 //   - goos lets a test exercise every branch of openBrowser.
 //   - callbackTimeout shortens the OAuth wait window in tests.
+//   - generateVerifier is the PKCE code-verifier source; swappable so a
+//     test can pin it to a known value (or force regeneration).
 var (
-	logFatal        = log.Fatal
-	openBrowserFn   = openBrowser
-	randRead        = rand.Read
-	goos            = runtime.GOOS
-	callbackTimeout = 5 * time.Minute
+	logFatal         = log.Fatal
+	openBrowserFn    = openBrowser
+	randRead         = rand.Read
+	goos             = runtime.GOOS
+	callbackTimeout  = 5 * time.Minute
+	generateVerifier = oauth2.GenerateVerifier
+	// startCmd actually launches the resolved command. Indirected so the
+	// switch-dispatch test can exercise every branch without spawning
+	// the host's default browser.
+	startCmd = func(c *exec.Cmd) error { return c.Start() }
 )
 
 func main() {
@@ -69,7 +77,8 @@ func run() error {
 	}
 
 	oauthCfg := cfg.OAuth2Config()
-	authURL := oauthCfg.AuthCodeURL(state)
+	verifier := generateVerifier()
+	authURL := oauthCfg.AuthCodeURL(state, oauth2.S256ChallengeOption(verifier))
 
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
@@ -134,7 +143,7 @@ func run() error {
 
 	_ = server.Shutdown(context.Background())
 
-	tok, err := oauthCfg.Exchange(ctx, code)
+	tok, err := oauthCfg.Exchange(ctx, code, oauth2.VerifierOption(verifier))
 	if err != nil {
 		return fmt.Errorf("exchange code for token: %w", err)
 	}
@@ -142,8 +151,7 @@ func run() error {
 		return fmt.Errorf("save token: %w", err)
 	}
 
-	path, _ := auth.TokenStorePath()
-	fmt.Printf("\nToken saved to %s\n", path)
+	fmt.Printf("\nToken saved to %s\n", auth.TokenStoreLocation())
 	if !tok.Expiry.IsZero() {
 		fmt.Printf("Access token expires at %s (in %s)\n", tok.Expiry.Format(time.RFC3339), time.Until(tok.Expiry).Round(time.Second))
 	}
@@ -171,5 +179,5 @@ func openBrowser(target string) error {
 	default:
 		cmd = exec.Command("xdg-open", target)
 	}
-	return cmd.Start()
+	return startCmd(cmd)
 }

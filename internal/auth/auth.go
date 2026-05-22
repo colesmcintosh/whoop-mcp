@@ -5,11 +5,14 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/zalando/go-keyring"
 	"golang.org/x/oauth2"
 )
 
@@ -74,14 +77,50 @@ func (c *Config) OAuth2Config() *oauth2.Config {
 	}
 }
 
-// userConfigDir and marshalIndent are swappable in tests to exercise
-// the OS- and encoding-level error paths in TokenStorePath/SaveToken.
+// Backend names a place where the stdio-mode OAuth token is persisted.
+type Backend string
+
+const (
+	BackendFile    Backend = "file"
+	BackendKeyring Backend = "keyring"
+)
+
+const (
+	keyringService    = "whoop-mcp"
+	keyringDefaultAcc = "default"
+)
+
+// ResolveBackend returns the token backend selected by WHOOP_TOKEN_BACKEND.
+// Default is BackendFile so existing setups keep working unchanged.
+func ResolveBackend() Backend {
+	switch strings.ToLower(os.Getenv("WHOOP_TOKEN_BACKEND")) {
+	case "keyring":
+		return BackendKeyring
+	default:
+		return BackendFile
+	}
+}
+
+func keyringAccount() string {
+	if a := os.Getenv("WHOOP_KEYRING_ACCOUNT"); a != "" {
+		return a
+	}
+	return keyringDefaultAcc
+}
+
+// userConfigDir, marshalIndent, keyringSet, keyringGet are swappable in
+// tests to exercise the OS- and encoding-level error paths.
 var (
 	userConfigDir = os.UserConfigDir
 	marshalIndent = json.MarshalIndent
+	keyringSet    = keyring.Set
+	keyringGet    = keyring.Get
 )
 
-// TokenStorePath returns the path where the token is persisted.
+// TokenStorePath returns the file-backend path where the token is
+// persisted. When the keyring backend is selected it still returns the
+// file path for callers that want to display the fallback location;
+// reads and writes do not actually touch this path.
 func TokenStorePath() (string, error) {
 	if override := os.Getenv("WHOOP_TOKEN_FILE"); override != "" {
 		return override, nil
@@ -93,8 +132,32 @@ func TokenStorePath() (string, error) {
 	return filepath.Join(dir, "whoop-mcp", "token.json"), nil
 }
 
-// SaveToken persists the token to disk with 0600 permissions.
+// TokenStoreLocation returns a human-readable description of where the
+// token is stored, suitable for log output.
+func TokenStoreLocation() string {
+	if ResolveBackend() == BackendKeyring {
+		return fmt.Sprintf("OS keychain (service=%s, account=%s)", keyringService, keyringAccount())
+	}
+	path, err := TokenStorePath()
+	if err != nil {
+		return "<token file>"
+	}
+	return path
+}
+
+// SaveToken persists the token using the configured backend.
+//
+// File backend: writes JSON to TokenStorePath() with 0600 permissions.
+// Keyring backend: writes the JSON payload to the OS keychain
+// (macOS Keychain / GNOME Keyring / Windows Credential Manager).
 func SaveToken(tok *oauth2.Token) error {
+	data, err := marshalIndent(tok, "", "  ")
+	if err != nil {
+		return err
+	}
+	if ResolveBackend() == BackendKeyring {
+		return keyringSet(keyringService, keyringAccount(), string(data))
+	}
 	path, err := TokenStorePath()
 	if err != nil {
 		return err
@@ -102,23 +165,18 @@ func SaveToken(tok *oauth2.Token) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	data, err := marshalIndent(tok, "", "  ")
-	if err != nil {
-		return err
-	}
 	return os.WriteFile(path, data, 0o600)
 }
 
-// SeedRefreshTokenIfMissing writes a token file containing only the given
-// refresh token if no token file exists yet. On the first refresh, Whoop
+// SeedRefreshTokenIfMissing writes a token containing only the given
+// refresh token if no token is stored yet. On the first refresh, Whoop
 // will mint a fresh access+refresh token pair which the persisting token
-// source then writes back to disk.
+// source then writes back.
 //
 // This is the bootstrap mechanism for hosted deployments where running
 // the browser-based OAuth flow on the server is impractical: authorize
-// once locally with whoop-auth, copy the refresh_token from
-// ~/Library/Application Support/whoop-mcp/token.json into a Railway env
-// var, and the server will seed the file on first start.
+// once locally with whoop-auth, copy the refresh_token into a Railway
+// env var, and the server will seed on first start.
 func SeedRefreshTokenIfMissing(refreshToken string) error {
 	if refreshToken == "" {
 		return nil
@@ -132,13 +190,23 @@ func SeedRefreshTokenIfMissing(refreshToken string) error {
 
 // LoadToken reads a token previously saved with SaveToken.
 func LoadToken() (*oauth2.Token, error) {
-	path, err := TokenStorePath()
-	if err != nil {
-		return nil, err
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
+	var data []byte
+	if ResolveBackend() == BackendKeyring {
+		s, err := keyringGet(keyringService, keyringAccount())
+		if err != nil {
+			return nil, err
+		}
+		data = []byte(s)
+	} else {
+		path, err := TokenStorePath()
+		if err != nil {
+			return nil, err
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		data = b
 	}
 	var tok oauth2.Token
 	if err := json.Unmarshal(data, &tok); err != nil {
@@ -147,9 +215,13 @@ func LoadToken() (*oauth2.Token, error) {
 	return &tok, nil
 }
 
+// ErrNoToken is reported by LoadToken-ish callers when no token has been
+// stored yet, regardless of which backend is selected.
+var ErrNoToken = errors.New("no token stored")
+
 // persistingTokenSource wraps an oauth2.TokenSource and writes refreshed
-// tokens back to disk. Whoop invalidates the previous refresh token on
-// every refresh, so persistence is mandatory.
+// tokens back to the configured backend. Whoop invalidates the previous
+// refresh token on every refresh, so persistence is mandatory.
 type persistingTokenSource struct {
 	src oauth2.TokenSource
 }

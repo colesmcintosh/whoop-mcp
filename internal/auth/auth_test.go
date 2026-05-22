@@ -9,8 +9,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zalando/go-keyring"
 	"golang.org/x/oauth2"
 )
+
+// withMockKeyring swaps in an in-memory keyring for the test and clears
+// any prior entry under (service, account). It also flips the backend
+// env var to "keyring" for the test's duration.
+func withMockKeyring(t *testing.T) {
+	t.Helper()
+	keyring.MockInit()
+	t.Setenv("WHOOP_TOKEN_BACKEND", "keyring")
+}
 
 // withTempTokenFile points TokenStorePath at a fresh temp file for the test.
 func withTempTokenFile(t *testing.T) string {
@@ -254,6 +264,139 @@ func TestPersistingTokenSourcePropagatesSaveError(t *testing.T) {
 	src := &persistingTokenSource{src: &fakeTokenSource{tok: fresh}}
 	if _, err := src.Token(); err == nil {
 		t.Fatal("expected save error to surface")
+	}
+}
+
+func TestResolveBackendDefaultsToFile(t *testing.T) {
+	t.Setenv("WHOOP_TOKEN_BACKEND", "")
+	if b := ResolveBackend(); b != BackendFile {
+		t.Fatalf("default backend = %q, want file", b)
+	}
+}
+
+func TestResolveBackendKeyringCaseInsensitive(t *testing.T) {
+	t.Setenv("WHOOP_TOKEN_BACKEND", "KeYrInG")
+	if b := ResolveBackend(); b != BackendKeyring {
+		t.Fatalf("backend = %q, want keyring", b)
+	}
+}
+
+func TestTokenStoreLocationFile(t *testing.T) {
+	t.Setenv("WHOOP_TOKEN_BACKEND", "")
+	t.Setenv("WHOOP_TOKEN_FILE", "/tmp/whatever.json")
+	if got := TokenStoreLocation(); got != "/tmp/whatever.json" {
+		t.Fatalf("got %q, want file path", got)
+	}
+}
+
+func TestTokenStoreLocationFileError(t *testing.T) {
+	t.Setenv("WHOOP_TOKEN_BACKEND", "")
+	t.Setenv("WHOOP_TOKEN_FILE", "")
+	orig := userConfigDir
+	t.Cleanup(func() { userConfigDir = orig })
+	userConfigDir = func() (string, error) { return "", errors.New("nope") }
+	if got := TokenStoreLocation(); got != "<token file>" {
+		t.Fatalf("got %q, want fallback string", got)
+	}
+}
+
+func TestTokenStoreLocationKeyring(t *testing.T) {
+	withMockKeyring(t)
+	t.Setenv("WHOOP_KEYRING_ACCOUNT", "")
+	got := TokenStoreLocation()
+	if !strings.Contains(got, "OS keychain") || !strings.Contains(got, "account=default") {
+		t.Fatalf("got %q, want OS keychain description with default account", got)
+	}
+}
+
+func TestTokenStoreLocationKeyringCustomAccount(t *testing.T) {
+	withMockKeyring(t)
+	t.Setenv("WHOOP_KEYRING_ACCOUNT", "alice")
+	got := TokenStoreLocation()
+	if !strings.Contains(got, "account=alice") {
+		t.Fatalf("got %q, want alice account", got)
+	}
+}
+
+func TestKeyringSaveLoadRoundTrip(t *testing.T) {
+	withMockKeyring(t)
+	tok := &oauth2.Token{AccessToken: "a", RefreshToken: "r"}
+	if err := SaveToken(tok); err != nil {
+		t.Fatalf("SaveToken: %v", err)
+	}
+	got, err := LoadToken()
+	if err != nil {
+		t.Fatalf("LoadToken: %v", err)
+	}
+	if got.AccessToken != "a" || got.RefreshToken != "r" {
+		t.Fatalf("round-trip mismatch: %+v", got)
+	}
+}
+
+func TestKeyringLoadMissing(t *testing.T) {
+	withMockKeyring(t)
+	if _, err := LoadToken(); err == nil {
+		t.Fatal("expected error when keyring is empty")
+	}
+}
+
+func TestKeyringSaveTokenSetError(t *testing.T) {
+	withMockKeyring(t)
+	orig := keyringSet
+	t.Cleanup(func() { keyringSet = orig })
+	keyringSet = func(string, string, string) error { return errors.New("set boom") }
+	if err := SaveToken(&oauth2.Token{AccessToken: "x"}); err == nil {
+		t.Fatal("expected keyring set error")
+	}
+}
+
+func TestKeyringSaveTokenMarshalError(t *testing.T) {
+	withMockKeyring(t)
+	orig := marshalIndent
+	t.Cleanup(func() { marshalIndent = orig })
+	marshalIndent = func(any, string, string) ([]byte, error) {
+		return nil, errors.New("marshal boom")
+	}
+	if err := SaveToken(&oauth2.Token{AccessToken: "x"}); err == nil {
+		t.Fatal("expected marshal error")
+	}
+}
+
+func TestKeyringLoadTokenParseError(t *testing.T) {
+	withMockKeyring(t)
+	if err := keyring.Set(keyringService, keyringAccount(), "{not json"); err != nil {
+		t.Fatalf("seed keyring: %v", err)
+	}
+	if _, err := LoadToken(); err == nil {
+		t.Fatal("expected JSON parse error")
+	}
+}
+
+func TestKeyringSeedRefreshTokenIfMissing(t *testing.T) {
+	withMockKeyring(t)
+	if err := SeedRefreshTokenIfMissing("seed-rt"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	tok, err := LoadToken()
+	if err != nil {
+		t.Fatalf("LoadToken: %v", err)
+	}
+	if tok.RefreshToken != "seed-rt" {
+		t.Fatalf("RefreshToken = %q, want seed-rt", tok.RefreshToken)
+	}
+	// Existing entry: no overwrite.
+	if err := SeedRefreshTokenIfMissing("other-rt"); err != nil {
+		t.Fatalf("re-seed: %v", err)
+	}
+	tok2, _ := LoadToken()
+	if tok2.RefreshToken != "seed-rt" {
+		t.Fatalf("seed overwrote existing entry: %q", tok2.RefreshToken)
+	}
+}
+
+func TestErrNoTokenSentinelExported(t *testing.T) {
+	if ErrNoToken == nil || ErrNoToken.Error() == "" {
+		t.Fatal("ErrNoToken should be a non-nil sentinel")
 	}
 }
 

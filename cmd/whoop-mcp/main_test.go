@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -256,30 +257,31 @@ func TestClientIPMalformedRemoteAddr(t *testing.T) {
 
 func TestStateStorePutConsume(t *testing.T) {
 	s := newStateStore()
-	s.put("abc")
-	if !s.consume("abc") {
-		t.Fatal("first consume should succeed")
+	s.put("abc", "verifier-abc")
+	got, ok := s.consume("abc")
+	if !ok || got != "verifier-abc" {
+		t.Fatalf("first consume = %q,%v; want verifier-abc,true", got, ok)
 	}
-	if s.consume("abc") {
+	if _, ok := s.consume("abc"); ok {
 		t.Fatal("second consume should fail (single use)")
 	}
-	if s.consume("never-put") {
+	if _, ok := s.consume("never-put"); ok {
 		t.Fatal("unknown state should fail")
 	}
 }
 
 func TestStateStoreExpires(t *testing.T) {
 	s := newStateStore()
-	s.put("old")
+	s.put("old", "v-old")
 	// Tamper with the timestamp to simulate >10min age.
 	s.mu.Lock()
-	s.vals["old"] = time.Now().Add(-11 * time.Minute)
+	s.vals["old"] = stateEntry{verifier: "v-old", at: time.Now().Add(-11 * time.Minute)}
 	s.mu.Unlock()
-	if s.consume("old") {
+	if _, ok := s.consume("old"); ok {
 		t.Fatal("expired state should not consume")
 	}
 	// The next put should clean expired entries.
-	s.put("fresh")
+	s.put("fresh", "v-fresh")
 	s.mu.Lock()
 	_, oldStillThere := s.vals["old"]
 	s.mu.Unlock()
@@ -421,6 +423,66 @@ func TestHandleLoginRedirects(t *testing.T) {
 	if !strings.Contains(w.Header().Get("Set-Cookie"), "whoop_oauth_state") {
 		t.Fatal("missing state cookie")
 	}
+	// PKCE: redirect must carry code_challenge=...&code_challenge_method=S256.
+	u, err := url.Parse(loc)
+	if err != nil {
+		t.Fatalf("parse redirect: %v", err)
+	}
+	if u.Query().Get("code_challenge") == "" {
+		t.Fatal("redirect missing code_challenge")
+	}
+	if m := u.Query().Get("code_challenge_method"); m != "S256" {
+		t.Fatalf("code_challenge_method = %q, want S256", m)
+	}
+}
+
+// TestHandleCallbackSendsPKCEVerifier checks that the per-state PKCE
+// verifier is forwarded to the token endpoint on exchange.
+func TestHandleCallbackSendsPKCEVerifier(t *testing.T) {
+	var gotVerifier string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/auth", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		gotVerifier = r.Form.Get("code_verifier")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"a","refresh_token":"r","token_type":"Bearer","expires_in":3600}`))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	ta := newTestApp(t)
+	ta.app.oauth = &oauth2.Config{
+		ClientID:     ta.app.oauth.ClientID,
+		ClientSecret: ta.app.oauth.ClientSecret,
+		RedirectURL:  ta.app.oauth.RedirectURL,
+		Scopes:       ta.app.oauth.Scopes,
+		Endpoint: oauth2.Endpoint{
+			AuthURL:   srv.URL + "/auth",
+			TokenURL:  srv.URL + "/token",
+			AuthStyle: oauth2.AuthStyleInParams,
+		},
+	}
+
+	// Drive /login so a verifier is stored under a real state.
+	wLogin := httptest.NewRecorder()
+	ta.app.handleLogin(wLogin, httptest.NewRequest("GET", "/login", nil))
+	if wLogin.Code != http.StatusFound {
+		t.Fatalf("login status = %d", wLogin.Code)
+	}
+	cookieHeader := wLogin.Header().Get("Set-Cookie")
+	state := strings.TrimPrefix(strings.SplitN(cookieHeader, ";", 2)[0], "whoop_oauth_state=")
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/oauth/callback?state="+state+"&code=abcd", nil)
+	r.AddCookie(&http.Cookie{Name: "whoop_oauth_state", Value: state})
+	ta.app.handleCallback(w, r)
+	if w.Code != 200 {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	if gotVerifier == "" {
+		t.Fatal("token exchange did not carry code_verifier")
+	}
 }
 
 func TestHandleLoginRateLimited(t *testing.T) {
@@ -470,9 +532,23 @@ func TestHandleCallbackBadState(t *testing.T) {
 	}
 }
 
+// TestHandleCallbackCookieMatchesButStateNotStored hits the branch where
+// query state == cookie state but the state was never recorded (or has
+// already been consumed). The handler must refuse the callback.
+func TestHandleCallbackCookieMatchesButStateNotStored(t *testing.T) {
+	ta := newTestApp(t)
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/oauth/callback?state=ghost&code=x", nil)
+	r.AddCookie(&http.Cookie{Name: "whoop_oauth_state", Value: "ghost"})
+	ta.app.handleCallback(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", w.Code)
+	}
+}
+
 func TestHandleCallbackMissingCode(t *testing.T) {
 	ta := newTestApp(t)
-	ta.app.states.put("st")
+	ta.app.states.put("st", "v")
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/oauth/callback?state=st", nil)
 	r.AddCookie(&http.Cookie{Name: "whoop_oauth_state", Value: "st"})
@@ -484,7 +560,7 @@ func TestHandleCallbackMissingCode(t *testing.T) {
 
 func TestHandleCallbackSuccess(t *testing.T) {
 	ta := newTestApp(t)
-	ta.app.states.put("ok")
+	ta.app.states.put("ok", "v")
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/oauth/callback?state=ok&code=abcd", nil)
 	r.AddCookie(&http.Cookie{Name: "whoop_oauth_state", Value: "ok"})
@@ -517,7 +593,7 @@ func TestHandleCallbackTokenExchangeError(t *testing.T) {
 			AuthStyle: oauth2.AuthStyleInParams,
 		},
 	}
-	ta.app.states.put("ok")
+	ta.app.states.put("ok", "v")
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/oauth/callback?state=ok&code=abcd", nil)
 	r.AddCookie(&http.Cookie{Name: "whoop_oauth_state", Value: "ok"})
@@ -529,7 +605,7 @@ func TestHandleCallbackTokenExchangeError(t *testing.T) {
 
 func TestHandleCallbackPersistError(t *testing.T) {
 	ta := newTestApp(t)
-	ta.app.states.put("ok")
+	ta.app.states.put("ok", "v")
 	// Read-only store dir so any Put fails.
 	dir := ta.app.store.Dir()
 	if err := chmodRO(dir); err != nil {
@@ -547,7 +623,7 @@ func TestHandleCallbackPersistError(t *testing.T) {
 
 func TestHandleCallbackRandError(t *testing.T) {
 	ta := newTestApp(t)
-	ta.app.states.put("ok")
+	ta.app.states.put("ok", "v")
 	orig := storeNewID
 	t.Cleanup(func() { storeNewID = orig })
 	storeNewID = func() (string, error) { return "", errors.New("rand boom") }

@@ -73,6 +73,8 @@ Copy the **Client ID** and **Client Secret**.
 | `PUBLIC_URL` | yes (HTTP mode) | Externally reachable `https://` URL of the deployed server, no trailing slash. |
 | `USER_STORE_DIR` | optional | Where per-user JSON token files live. Default `/data/users`. Put this on persistent storage. |
 | `PORT` *or* `MCP_HTTP_ADDR` | yes (HTTP mode) | Listening address. Platforms like Railway set `PORT`. |
+| `WHOOP_TOKEN_BACKEND` | optional (stdio mode) | Where the local OAuth token is stored. `file` (default) writes JSON to `WHOOP_TOKEN_FILE`; `keyring` uses the OS keychain (macOS Keychain / GNOME Keyring / Windows Credential Manager). HTTP mode is unaffected — per-user tokens always live in `USER_STORE_DIR`. |
+| `WHOOP_KEYRING_ACCOUNT` | optional | Account name used inside the keychain entry. Defaults to `default`. Set this if you want multiple Whoop accounts on the same machine. |
 
 ### 3. Deploy
 
@@ -114,7 +116,16 @@ go build -o bin/whoop-auth ./cmd/whoop-auth
 
 export WHOOP_CLIENT_ID=...
 export WHOOP_CLIENT_SECRET=...
-./bin/whoop-auth                 # one-time OAuth, persists token to ~/.config/whoop-mcp/token.json
+./bin/whoop-auth                 # one-time OAuth (PKCE), persists token to ~/.config/whoop-mcp/token.json
+```
+
+To keep the token out of the filesystem entirely, store it in the OS
+keychain instead:
+
+```sh
+export WHOOP_TOKEN_BACKEND=keyring
+./bin/whoop-auth                 # writes to macOS Keychain / libsecret / Credential Manager
+./bin/whoop-mcp                  # reads from the same place
 ```
 
 Then register the stdio server with Claude Code:
