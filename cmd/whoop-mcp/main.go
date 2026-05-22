@@ -275,35 +275,41 @@ func clientIP(r *http.Request) string {
 	return host
 }
 
-// stateStore tracks short-lived OAuth state values to defeat CSRF.
+// stateStore tracks short-lived OAuth state values to defeat CSRF, plus
+// the per-flow PKCE code verifier so callback can complete the exchange.
 type stateStore struct {
 	mu   sync.Mutex
-	vals map[string]time.Time
+	vals map[string]stateEntry
 }
 
-func newStateStore() *stateStore { return &stateStore{vals: map[string]time.Time{}} }
+type stateEntry struct {
+	verifier string
+	at       time.Time
+}
 
-func (s *stateStore) put(v string) {
+func newStateStore() *stateStore { return &stateStore{vals: map[string]stateEntry{}} }
+
+func (s *stateStore) put(v, verifier string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cutoff := time.Now().Add(-10 * time.Minute)
-	for k, t := range s.vals {
-		if t.Before(cutoff) {
+	for k, e := range s.vals {
+		if e.at.Before(cutoff) {
 			delete(s.vals, k)
 		}
 	}
-	s.vals[v] = time.Now()
+	s.vals[v] = stateEntry{verifier: verifier, at: time.Now()}
 }
 
-func (s *stateStore) consume(v string) bool {
+func (s *stateStore) consume(v string) (string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	t, ok := s.vals[v]
-	if !ok || time.Since(t) > 10*time.Minute {
-		return false
+	e, ok := s.vals[v]
+	if !ok || time.Since(e.at) > 10*time.Minute {
+		return "", false
 	}
 	delete(s.vals, v)
-	return true
+	return e.verifier, true
 }
 
 // randReadMain and storeNewID are swappable in tests to exercise the
@@ -778,7 +784,8 @@ func (a *app) handleLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	a.states.put(state)
+	verifier := oauth2.GenerateVerifier()
+	a.states.put(state, verifier)
 	http.SetCookie(w, &http.Cookie{
 		Name:     "whoop_oauth_state",
 		Value:    state,
@@ -788,7 +795,7 @@ func (a *app) handleLogin(w http.ResponseWriter, r *http.Request) {
 		Secure:   strings.HasPrefix(a.publicURL, "https://"),
 		SameSite: http.SameSiteLaxMode,
 	})
-	http.Redirect(w, r, a.oauth.AuthCodeURL(state), http.StatusFound)
+	http.Redirect(w, r, a.oauth.AuthCodeURL(state, oauth2.S256ChallengeOption(verifier)), http.StatusFound)
 }
 
 func (a *app) handleCallback(w http.ResponseWriter, r *http.Request) {
@@ -799,7 +806,12 @@ func (a *app) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	state := q.Get("state")
 	cookie, _ := r.Cookie("whoop_oauth_state")
-	if state == "" || cookie == nil || cookie.Value != state || !a.states.consume(state) {
+	if state == "" || cookie == nil || cookie.Value != state {
+		http.Error(w, "invalid or expired state", http.StatusBadRequest)
+		return
+	}
+	verifier, ok := a.states.consume(state)
+	if !ok {
 		http.Error(w, "invalid or expired state", http.StatusBadRequest)
 		return
 	}
@@ -810,7 +822,7 @@ func (a *app) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	tok, err := a.oauth.Exchange(ctx, code)
+	tok, err := a.oauth.Exchange(ctx, code, oauth2.VerifierOption(verifier))
 	if err != nil {
 		http.Error(w, "token exchange failed: "+err.Error(), http.StatusBadGateway)
 		return

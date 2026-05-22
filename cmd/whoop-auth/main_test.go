@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -98,6 +99,77 @@ func withFakeOAuthServer(t *testing.T) *httptest.Server {
 	return srv
 }
 
+// TestRunPKCEParamsFlowThrough drives a full run() and asserts the
+// auth URL carries an S256 code_challenge and the token-exchange POST
+// carries a matching code_verifier.
+func TestRunPKCEParamsFlowThrough(t *testing.T) {
+	var (
+		gotChallenge       string
+		gotChallengeMethod string
+		gotVerifier        string
+	)
+
+	// Custom OAuth server that captures the verifier from the token POST.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		gotVerifier = r.Form.Get("code_verifier")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"a","refresh_token":"r","token_type":"Bearer","expires_in":3600}`))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	origAuth, origToken := auth.AuthURL, auth.TokenURL
+	t.Cleanup(func() { auth.AuthURL = origAuth; auth.TokenURL = origToken })
+	auth.AuthURL = srv.URL + "/auth"
+	auth.TokenURL = srv.URL + "/token"
+
+	resetEnv(t)
+	t.Setenv("WHOOP_CLIENT_ID", "id")
+	t.Setenv("WHOOP_CLIENT_SECRET", "sec")
+	port := freePort(t)
+	t.Setenv("WHOOP_REDIRECT_URI", fmt.Sprintf("http://localhost:%d/callback", port))
+	tokFile := filepath.Join(t.TempDir(), "token.json")
+	t.Setenv("WHOOP_TOKEN_FILE", tokFile)
+
+	// Capture both state and PKCE parameters from the redirect URL.
+	type captured struct{ state string }
+	capCh := make(chan captured, 1)
+	origBrowser := openBrowserFn
+	t.Cleanup(func() { openBrowserFn = origBrowser })
+	openBrowserFn = func(authURL string) error {
+		u, err := url.Parse(authURL)
+		if err != nil {
+			return err
+		}
+		q := u.Query()
+		gotChallenge = q.Get("code_challenge")
+		gotChallengeMethod = q.Get("code_challenge_method")
+		capCh <- captured{state: q.Get("state")}
+		return nil
+	}
+
+	go func() {
+		waitForListener(t, port)
+		c := <-capCh
+		_, _ = http.Get(fmt.Sprintf("http://localhost:%d/callback?state=%s&code=abcd", port, c.state))
+	}()
+
+	if err := run(); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if gotChallenge == "" {
+		t.Fatal("auth URL missing code_challenge")
+	}
+	if gotChallengeMethod != "S256" {
+		t.Fatalf("code_challenge_method = %q, want S256", gotChallengeMethod)
+	}
+	if gotVerifier == "" {
+		t.Fatal("token exchange did not carry code_verifier")
+	}
+}
+
 func TestRandomState(t *testing.T) {
 	a, err := randomState()
 	if err != nil {
@@ -119,16 +191,26 @@ func TestRandomStateRandError(t *testing.T) {
 }
 
 func TestOpenBrowserDispatchesByGOOS(t *testing.T) {
-	orig := goos
-	t.Cleanup(func() { goos = orig })
+	origGOOS := goos
+	origStart := startCmd
+	t.Cleanup(func() { goos = origGOOS; startCmd = origStart })
+
+	var got []string
+	startCmd = func(c *exec.Cmd) error {
+		got = append(got, c.Path+" "+strings.Join(c.Args[1:], " "))
+		return nil
+	}
+
 	for _, os := range []string{"darwin", "windows", "linux"} {
 		t.Run(os, func(_ *testing.T) {
 			goos = os
-			// Don't care about the result — most of these commands
-			// won't exist or won't succeed, but the call exercises the
-			// switch arm.
-			_ = openBrowser("http://example.test")
+			if err := openBrowser("http://example.test"); err != nil {
+				t.Fatalf("openBrowser: %v", err)
+			}
 		})
+	}
+	if len(got) != 3 {
+		t.Fatalf("expected 3 dispatches, got %d", len(got))
 	}
 }
 

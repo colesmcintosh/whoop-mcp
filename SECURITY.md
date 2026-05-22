@@ -28,6 +28,9 @@ deployed by the hosting operator. There is no LTS branch.
   cryptographic randomness, so guessing is not practical.
 - Whoop OAuth refresh tokens are stored on disk under the configured
   `USER_STORE_DIR`. Anyone with access to that directory can read them.
+- The OAuth authorization-code flow uses PKCE (RFC 7636, S256). Even if an
+  authorization code is intercepted on the redirect, it cannot be exchanged
+  without the per-flow code verifier held in server (or CLI) memory.
 - `/login` is rate limited per IP to defeat trivially repeated grants.
 - A baseline of HTTP security headers (CSP, `X-Frame-Options: DENY`, etc.) is
   applied to the HTML pages.
@@ -36,8 +39,11 @@ deployed by the hosting operator. There is no LTS branch.
 
 - DoS resilience beyond the basic per-IP rate limit. Use a platform-level
   WAF/rate-limit if you expect public traffic.
-- Encryption of tokens at rest. They are stored as readable JSON files. If
-  this matters, run on disk encrypted by the host OS or platform.
+- Encryption of tokens at rest. Hosted (HTTP-mode) per-user tokens are stored
+  as readable JSON files under `USER_STORE_DIR`. If this matters, run on disk
+  encrypted by the host OS or platform. The local stdio CLI can opt into
+  `WHOOP_TOKEN_BACKEND=keyring` to put the token in the OS keychain instead
+  of a JSON file under `~/.config/whoop-mcp/`.
 - Compromise of the underlying host. If the box is rooted, all user tokens
   on it are compromised; rotate them via `/disconnect/<id>` or by clearing
   the store directory.
