@@ -16,42 +16,51 @@ We aim to acknowledge reports within 72 hours. There is no bug bounty.
 ## Supported versions
 
 `whoop-mcp` is small and lives on `main`. Security fixes land on `main` and are
-deployed by the hosting operator. There is no LTS branch.
+deployed by the operator who self-hosts it. There is no LTS branch.
 
 ## Threat model (in scope)
 
-`whoop-mcp` is a hosted multi-tenant connector. The intended threat model:
+`whoop-mcp` is a single-tenant, self-hosted connector: one instance serves one
+Whoop account, run by the person whose account it is. The intended threat
+model:
 
-- The hosted instance terminates TLS via the platform (Railway, Fly, your own).
-- Each user's `/connect/<id>` URL is the credential. Anyone with that URL can
-  read that user's Whoop data via the MCP tools. The id is 24 bytes of
-  cryptographic randomness, so guessing is not practical.
-- Whoop OAuth refresh tokens are stored on disk under the configured
-  `USER_STORE_DIR`. Anyone with access to that directory can read them.
+- The operator terminates TLS (locally, or via a platform / reverse proxy)
+  whenever the server is exposed beyond localhost.
+- `AUTH_TOKEN`, when set, is the credential. It gates the browser connect /
+  disconnect UI (via an `HttpOnly` cookie set after the operator pastes it)
+  and is required as `Authorization: Bearer <AUTH_TOKEN>` on the `/mcp`
+  endpoint. Comparisons are constant-time.
+- **If `AUTH_TOKEN` is unset, there is no application-level auth.** This is
+  intended only for localhost / private-network use. The server logs a warning
+  at startup when it is not bound to localhost and `AUTH_TOKEN` is unset.
+  Anyone who can reach an unauthenticated instance can read the connected
+  account's data and can hijack the connect flow.
+- The single Whoop OAuth token is stored on disk at `WHOOP_TOKEN_FILE`
+  (default `/data/token.json`) as readable JSON, or in the OS keychain when
+  `WHOOP_TOKEN_BACKEND=keyring`. Anyone with access to that location can read
+  it.
 - The OAuth authorization-code flow uses PKCE (RFC 7636, S256). Even if an
   authorization code is intercepted on the redirect, it cannot be exchanged
-  without the per-flow code verifier held in server (or CLI) memory.
-- `/login` is rate limited per IP to defeat trivially repeated grants.
+  without the per-flow code verifier held in server memory.
+- `/login` and `/unlock` are rate limited per IP to slow brute-force attempts.
 - A baseline of HTTP security headers (CSP, `X-Frame-Options: DENY`, etc.) is
   applied to the HTML pages.
 
 ## Out of scope
 
 - DoS resilience beyond the basic per-IP rate limit. Use a platform-level
-  WAF/rate-limit if you expect public traffic.
-- Encryption of tokens at rest. Hosted (HTTP-mode) per-user tokens are stored
-  as readable JSON files under `USER_STORE_DIR`. If this matters, run on disk
-  encrypted by the host OS or platform. The local stdio CLI can opt into
-  `WHOOP_TOKEN_BACKEND=keyring` to put the token in the OS keychain instead
-  of a JSON file under `~/.config/whoop-mcp/`.
-- Compromise of the underlying host. If the box is rooted, all user tokens
-  on it are compromised; rotate them via `/disconnect/<id>` or by clearing
-  the store directory.
+  WAF/rate-limit if you expose the server publicly.
+- Encryption of the token at rest. The `file` backend stores it as readable
+  JSON; run on a disk encrypted by the host OS or platform if that matters, or
+  use `WHOOP_TOKEN_BACKEND=keyring` to put it in the OS keychain instead.
+- Compromise of the underlying host. If the box is rooted, the stored token is
+  compromised; disconnect via `/disconnect` (or delete the token file) and
+  reconnect.
 
 ## Operational guidance
 
-- Treat `WHOOP_CLIENT_SECRET` as a high-value secret. Set it via the platform's
-  secret manager, never check it into git.
-- Keep the deployed `PUBLIC_URL` on HTTPS only — the OAuth state cookie is
-  marked `Secure` when `PUBLIC_URL` begins with `https://`.
-- Periodically clean up unused records in `USER_STORE_DIR`.
+- Treat `WHOOP_CLIENT_SECRET` and `AUTH_TOKEN` as high-value secrets. Set them
+  via the platform's secret manager, never check them into git.
+- Generate `AUTH_TOKEN` from a CSPRNG, e.g. `openssl rand -hex 32`.
+- Keep the deployed `PUBLIC_URL` on HTTPS only — the OAuth state and admin
+  cookies are marked `Secure` when the server is served over https.

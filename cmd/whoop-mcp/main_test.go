@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/colesmcintosh/whoop-mcp/internal/auth"
-	"github.com/colesmcintosh/whoop-mcp/internal/store"
 	"github.com/colesmcintosh/whoop-mcp/internal/whoop"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"golang.org/x/oauth2"
@@ -25,17 +24,28 @@ import (
 func chmodRO(dir string) error { return os.Chmod(dir, 0o500) }
 func chmodRW(dir string) error { return os.Chmod(dir, 0o700) }
 
-// testApp wires an app against fake OAuth and Whoop API servers.
+// skipIfRoot skips tests that rely on filesystem permission denial, which
+// root bypasses (so a read-only directory is still writable).
+func skipIfRoot(t *testing.T) {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: chmod-based permission denial is ineffective")
+	}
+}
+
+// testApp wires an app against fake OAuth and Whoop API servers, with the
+// single-token store pointed at a per-test temp file.
 type testApp struct {
 	app         *app
 	oauthServer *httptest.Server
 	whoopServer *httptest.Server
+	tokenFile   string
 	tokenCalls  *int
 	apiCalls    *[]string
 	revokeCalls *int
 }
 
-func newTestApp(t *testing.T, opts ...func(*testApp)) *testApp {
+func newTestApp(t *testing.T) *testApp {
 	t.Helper()
 
 	tokenCalls := 0
@@ -44,9 +54,6 @@ func newTestApp(t *testing.T, opts ...func(*testApp)) *testApp {
 
 	oauthMux := http.NewServeMux()
 	oauthMux.HandleFunc("/auth", func(w http.ResponseWriter, _ *http.Request) {
-		// Not directly used; the redirect goes through the browser, but
-		// the test exercises /oauth/callback directly. Stubbed so any
-		// stray request returns something sane.
 		w.WriteHeader(http.StatusOK)
 	})
 	oauthMux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
@@ -102,10 +109,10 @@ func newTestApp(t *testing.T, opts ...func(*testApp)) *testApp {
 	whoopServer := httptest.NewServer(whoopMux)
 	t.Cleanup(whoopServer.Close)
 
-	st, err := store.New(t.TempDir())
-	if err != nil {
-		t.Fatalf("store.New: %v", err)
-	}
+	// Single-token store on disk, per-test.
+	tokenFile := filepath.Join(t.TempDir(), "token.json")
+	t.Setenv("WHOOP_TOKEN_BACKEND", "file")
+	t.Setenv("WHOOP_TOKEN_FILE", tokenFile)
 
 	cfg := &auth.Config{
 		ClientID:     "cid",
@@ -126,7 +133,6 @@ func newTestApp(t *testing.T, opts ...func(*testApp)) *testApp {
 
 	a := &app{
 		cfg:          cfg,
-		store:        st,
 		publicURL:    "http://example.test",
 		oauth:        oauthCfg,
 		states:       newStateStore(),
@@ -134,21 +140,19 @@ func newTestApp(t *testing.T, opts ...func(*testApp)) *testApp {
 		whoopBaseURL: whoopServer.URL,
 	}
 
-	ta := &testApp{
+	return &testApp{
 		app:         a,
 		oauthServer: oauthServer,
 		whoopServer: whoopServer,
+		tokenFile:   tokenFile,
 		tokenCalls:  &tokenCalls,
 		apiCalls:    &apiCalls,
 		revokeCalls: &revokeCalls,
 	}
-	for _, opt := range opts {
-		opt(ta)
-	}
-	return ta
 }
 
-func (ta *testApp) seedUser(t *testing.T, id string, tok *oauth2.Token) *store.Record {
+// seedToken persists a stored token so the app counts as connected.
+func (ta *testApp) seedToken(t *testing.T, tok *oauth2.Token) {
 	t.Helper()
 	if tok == nil {
 		tok = &oauth2.Token{
@@ -157,11 +161,9 @@ func (ta *testApp) seedUser(t *testing.T, id string, tok *oauth2.Token) *store.R
 			Expiry:       time.Now().Add(time.Hour),
 		}
 	}
-	rec := &store.Record{ID: id, Token: tok, CreatedAt: time.Now()}
-	if err := ta.app.store.Put(rec); err != nil {
-		t.Fatalf("seed: %v", err)
+	if err := auth.SaveToken(tok); err != nil {
+		t.Fatalf("seed token: %v", err)
 	}
-	return rec
 }
 
 // ---- Helpers ----
@@ -211,8 +213,6 @@ func TestRateLimiterRefillsOverTime(t *testing.T) {
 
 func TestRateLimiterEvictsStale(t *testing.T) {
 	rl := newRateLimiter(1, 1)
-	// Pre-fill with > 2048 entries with old timestamps so the next allow()
-	// trips the eviction branch.
 	for i := 0; i < 2050; i++ {
 		rl.buckets[string(rune(i))+"-key"] = &tokenBucket{
 			tokens: 0,
@@ -255,6 +255,97 @@ func TestClientIPMalformedRemoteAddr(t *testing.T) {
 	}
 }
 
+func TestIsLoopback(t *testing.T) {
+	cases := map[string]bool{
+		"127.0.0.1:8080": true,
+		"localhost:8080": true,
+		"[::1]:8080":     true,
+		":8080":          false,
+		"0.0.0.0:8080":   false,
+		"192.168.1.5:80": false,
+	}
+	for addr, want := range cases {
+		if got := isLoopback(addr); got != want {
+			t.Errorf("isLoopback(%q) = %v, want %v", addr, got, want)
+		}
+	}
+}
+
+func TestPortSuffix(t *testing.T) {
+	if got := portSuffix(":8080"); got != ":8080" {
+		t.Fatalf("got %q", got)
+	}
+	if got := portSuffix("127.0.0.1:9000"); got != ":9000" {
+		t.Fatalf("got %q", got)
+	}
+	if got := portSuffix("noport"); got != "" {
+		t.Fatalf("got %q, want empty", got)
+	}
+}
+
+func TestBaseURLPrefersPublicURL(t *testing.T) {
+	a := &app{publicURL: "https://my.host"}
+	if got := a.baseURL(httptest.NewRequest("GET", "/", nil)); got != "https://my.host" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestBaseURLDerivesFromRequest(t *testing.T) {
+	a := &app{}
+	r := httptest.NewRequest("GET", "http://localhost:8080/", nil)
+	if got := a.baseURL(r); got != "http://localhost:8080" {
+		t.Fatalf("got %q", got)
+	}
+	r2 := httptest.NewRequest("GET", "/", nil)
+	r2.Host = "proxied.host"
+	r2.Header.Set("X-Forwarded-Proto", "https")
+	if got := a.baseURL(r2); got != "https://proxied.host" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestAuthedAdmin(t *testing.T) {
+	open := &app{authToken: ""}
+	if !open.authedAdmin(httptest.NewRequest("GET", "/", nil)) {
+		t.Fatal("open server should always be admin-authed")
+	}
+	locked := &app{authToken: "secret"}
+	if locked.authedAdmin(httptest.NewRequest("GET", "/", nil)) {
+		t.Fatal("missing cookie should not be authed")
+	}
+	r := httptest.NewRequest("GET", "/", nil)
+	r.AddCookie(&http.Cookie{Name: adminCookie, Value: "secret"})
+	if !locked.authedAdmin(r) {
+		t.Fatal("correct cookie should be authed")
+	}
+	rw := httptest.NewRequest("GET", "/", nil)
+	rw.AddCookie(&http.Cookie{Name: adminCookie, Value: "wrong"})
+	if locked.authedAdmin(rw) {
+		t.Fatal("wrong cookie should not be authed")
+	}
+}
+
+func TestAuthedBearer(t *testing.T) {
+	open := &app{authToken: ""}
+	if !open.authedBearer(httptest.NewRequest("GET", "/mcp", nil)) {
+		t.Fatal("open server should always be bearer-authed")
+	}
+	locked := &app{authToken: "secret"}
+	if locked.authedBearer(httptest.NewRequest("GET", "/mcp", nil)) {
+		t.Fatal("missing header should not be authed")
+	}
+	r := httptest.NewRequest("GET", "/mcp", nil)
+	r.Header.Set("Authorization", "Bearer secret")
+	if !locked.authedBearer(r) {
+		t.Fatal("correct bearer should be authed")
+	}
+	rw := httptest.NewRequest("GET", "/mcp", nil)
+	rw.Header.Set("Authorization", "Bearer nope")
+	if locked.authedBearer(rw) {
+		t.Fatal("wrong bearer should not be authed")
+	}
+}
+
 func TestStateStorePutConsume(t *testing.T) {
 	s := newStateStore()
 	s.put("abc", "verifier-abc")
@@ -273,14 +364,12 @@ func TestStateStorePutConsume(t *testing.T) {
 func TestStateStoreExpires(t *testing.T) {
 	s := newStateStore()
 	s.put("old", "v-old")
-	// Tamper with the timestamp to simulate >10min age.
 	s.mu.Lock()
 	s.vals["old"] = stateEntry{verifier: "v-old", at: time.Now().Add(-11 * time.Minute)}
 	s.mu.Unlock()
 	if _, ok := s.consume("old"); ok {
 		t.Fatal("expired state should not consume")
 	}
-	// The next put should clean expired entries.
 	s.put("fresh", "v-fresh")
 	s.mu.Lock()
 	_, oldStillThere := s.vals["old"]
@@ -386,15 +475,33 @@ func TestFaviconEndpoint(t *testing.T) {
 	}
 }
 
-func TestHandleLandingRoot(t *testing.T) {
+func TestHandleLandingNotConnected(t *testing.T) {
 	ta := newTestApp(t)
 	w := httptest.NewRecorder()
 	ta.app.handleLanding(w, httptest.NewRequest("GET", "/", nil))
 	if w.Code != 200 {
 		t.Fatalf("status = %d", w.Code)
 	}
-	if !strings.Contains(w.Body.String(), "Whoop MCP") {
-		t.Fatal("body missing brand")
+	body := w.Body.String()
+	if !strings.Contains(body, "Connect Whoop") {
+		t.Fatal("not-connected landing should invite connecting")
+	}
+}
+
+func TestHandleLandingConnected(t *testing.T) {
+	ta := newTestApp(t)
+	ta.seedToken(t, nil)
+	w := httptest.NewRecorder()
+	ta.app.handleLanding(w, httptest.NewRequest("GET", "/", nil))
+	if w.Code != 200 {
+		t.Fatalf("status = %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "/mcp") {
+		t.Fatal("connected landing should show the MCP URL")
+	}
+	if !strings.Contains(body, "Disconnect") {
+		t.Fatal("connected landing should offer disconnect")
 	}
 }
 
@@ -404,6 +511,67 @@ func TestHandleLandingNotFound(t *testing.T) {
 	ta.app.handleLanding(w, httptest.NewRequest("GET", "/some-other", nil))
 	if w.Code != 404 {
 		t.Fatalf("status = %d, want 404", w.Code)
+	}
+}
+
+func TestHandleLandingLockedShowsUnlock(t *testing.T) {
+	ta := newTestApp(t)
+	ta.app.authToken = "secret"
+	w := httptest.NewRecorder()
+	ta.app.handleLanding(w, httptest.NewRequest("GET", "/", nil))
+	if w.Code != 200 {
+		t.Fatalf("status = %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "access token") {
+		t.Fatal("locked landing should render the unlock form")
+	}
+}
+
+func TestHandleUnlockNoAuthTokenRedirects(t *testing.T) {
+	ta := newTestApp(t)
+	w := httptest.NewRecorder()
+	ta.app.handleUnlock(w, httptest.NewRequest("POST", "/unlock", nil))
+	if w.Code != http.StatusFound {
+		t.Fatalf("status = %d, want redirect", w.Code)
+	}
+}
+
+func TestHandleUnlockWrongToken(t *testing.T) {
+	ta := newTestApp(t)
+	ta.app.authToken = "secret"
+	form := strings.NewReader("token=nope")
+	r := httptest.NewRequest("POST", "/unlock", form)
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	ta.app.handleUnlock(w, r)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", w.Code)
+	}
+}
+
+func TestHandleUnlockCorrectTokenSetsCookie(t *testing.T) {
+	ta := newTestApp(t)
+	ta.app.authToken = "secret"
+	form := strings.NewReader("token=secret")
+	r := httptest.NewRequest("POST", "/unlock", form)
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	ta.app.handleUnlock(w, r)
+	if w.Code != http.StatusFound {
+		t.Fatalf("status = %d, want redirect", w.Code)
+	}
+	if !strings.Contains(w.Header().Get("Set-Cookie"), adminCookie) {
+		t.Fatal("expected admin cookie to be set")
+	}
+}
+
+func TestHandleUnlockMethodNotAllowed(t *testing.T) {
+	ta := newTestApp(t)
+	ta.app.authToken = "secret"
+	w := httptest.NewRecorder()
+	ta.app.handleUnlock(w, httptest.NewRequest("GET", "/unlock", nil))
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d", w.Code)
 	}
 }
 
@@ -419,11 +587,9 @@ func TestHandleLoginRedirects(t *testing.T) {
 	if !strings.HasPrefix(loc, ta.oauthServer.URL+"/auth") {
 		t.Fatalf("redirect = %q", loc)
 	}
-	// state cookie set
 	if !strings.Contains(w.Header().Get("Set-Cookie"), "whoop_oauth_state") {
 		t.Fatal("missing state cookie")
 	}
-	// PKCE: redirect must carry code_challenge=...&code_challenge_method=S256.
 	u, err := url.Parse(loc)
 	if err != nil {
 		t.Fatalf("parse redirect: %v", err)
@@ -436,52 +602,16 @@ func TestHandleLoginRedirects(t *testing.T) {
 	}
 }
 
-// TestHandleCallbackSendsPKCEVerifier checks that the per-state PKCE
-// verifier is forwarded to the token endpoint on exchange.
-func TestHandleCallbackSendsPKCEVerifier(t *testing.T) {
-	var gotVerifier string
-	mux := http.NewServeMux()
-	mux.HandleFunc("/auth", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
-	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
-		_ = r.ParseForm()
-		gotVerifier = r.Form.Get("code_verifier")
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"access_token":"a","refresh_token":"r","token_type":"Bearer","expires_in":3600}`))
-	})
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-
+func TestHandleLoginLockedRedirectsHome(t *testing.T) {
 	ta := newTestApp(t)
-	ta.app.oauth = &oauth2.Config{
-		ClientID:     ta.app.oauth.ClientID,
-		ClientSecret: ta.app.oauth.ClientSecret,
-		RedirectURL:  ta.app.oauth.RedirectURL,
-		Scopes:       ta.app.oauth.Scopes,
-		Endpoint: oauth2.Endpoint{
-			AuthURL:   srv.URL + "/auth",
-			TokenURL:  srv.URL + "/token",
-			AuthStyle: oauth2.AuthStyleInParams,
-		},
-	}
-
-	// Drive /login so a verifier is stored under a real state.
-	wLogin := httptest.NewRecorder()
-	ta.app.handleLogin(wLogin, httptest.NewRequest("GET", "/login", nil))
-	if wLogin.Code != http.StatusFound {
-		t.Fatalf("login status = %d", wLogin.Code)
-	}
-	cookieHeader := wLogin.Header().Get("Set-Cookie")
-	state := strings.TrimPrefix(strings.SplitN(cookieHeader, ";", 2)[0], "whoop_oauth_state=")
-
+	ta.app.authToken = "secret"
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest("GET", "/oauth/callback?state="+state+"&code=abcd", nil)
-	r.AddCookie(&http.Cookie{Name: "whoop_oauth_state", Value: state})
-	ta.app.handleCallback(w, r)
-	if w.Code != 200 {
-		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	ta.app.handleLogin(w, httptest.NewRequest("GET", "/login", nil))
+	if w.Code != http.StatusFound {
+		t.Fatalf("status = %d", w.Code)
 	}
-	if gotVerifier == "" {
-		t.Fatal("token exchange did not carry code_verifier")
+	if loc := w.Header().Get("Location"); loc != "/" {
+		t.Fatalf("locked login should redirect home, got %q", loc)
 	}
 }
 
@@ -512,6 +642,52 @@ func TestHandleLoginRandTokenError(t *testing.T) {
 	}
 }
 
+func TestHandleCallbackSendsPKCEVerifier(t *testing.T) {
+	var gotVerifier string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/auth", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		gotVerifier = r.Form.Get("code_verifier")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"a","refresh_token":"r","token_type":"Bearer","expires_in":3600}`))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	ta := newTestApp(t)
+	ta.app.oauth = &oauth2.Config{
+		ClientID:     ta.app.oauth.ClientID,
+		ClientSecret: ta.app.oauth.ClientSecret,
+		RedirectURL:  ta.app.oauth.RedirectURL,
+		Scopes:       ta.app.oauth.Scopes,
+		Endpoint: oauth2.Endpoint{
+			AuthURL:   srv.URL + "/auth",
+			TokenURL:  srv.URL + "/token",
+			AuthStyle: oauth2.AuthStyleInParams,
+		},
+	}
+
+	wLogin := httptest.NewRecorder()
+	ta.app.handleLogin(wLogin, httptest.NewRequest("GET", "/login", nil))
+	if wLogin.Code != http.StatusFound {
+		t.Fatalf("login status = %d", wLogin.Code)
+	}
+	cookieHeader := wLogin.Header().Get("Set-Cookie")
+	state := strings.TrimPrefix(strings.SplitN(cookieHeader, ";", 2)[0], "whoop_oauth_state=")
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/oauth/callback?state="+state+"&code=abcd", nil)
+	r.AddCookie(&http.Cookie{Name: "whoop_oauth_state", Value: state})
+	ta.app.handleCallback(w, r)
+	if w.Code != http.StatusFound {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	if gotVerifier == "" {
+		t.Fatal("token exchange did not carry code_verifier")
+	}
+}
+
 func TestHandleCallbackErrorParam(t *testing.T) {
 	ta := newTestApp(t)
 	w := httptest.NewRecorder()
@@ -532,9 +708,6 @@ func TestHandleCallbackBadState(t *testing.T) {
 	}
 }
 
-// TestHandleCallbackCookieMatchesButStateNotStored hits the branch where
-// query state == cookie state but the state was never recorded (or has
-// already been consumed). The handler must refuse the callback.
 func TestHandleCallbackCookieMatchesButStateNotStored(t *testing.T) {
 	ta := newTestApp(t)
 	w := httptest.NewRecorder()
@@ -558,30 +731,42 @@ func TestHandleCallbackMissingCode(t *testing.T) {
 	}
 }
 
-func TestHandleCallbackSuccess(t *testing.T) {
+func TestHandleCallbackSuccessStoresToken(t *testing.T) {
 	ta := newTestApp(t)
 	ta.app.states.put("ok", "v")
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/oauth/callback?state=ok&code=abcd", nil)
 	r.AddCookie(&http.Cookie{Name: "whoop_oauth_state", Value: "ok"})
 	ta.app.handleCallback(w, r)
-	if w.Code != 200 {
+	if w.Code != http.StatusFound {
 		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "/connect/") {
-		t.Fatal("body missing /connect URL")
-	}
-	if !strings.Contains(w.Body.String(), "Ada") {
-		t.Fatal("body missing user name from profile fetch")
+	if loc := w.Header().Get("Location"); loc != "/" {
+		t.Fatalf("expected redirect home, got %q", loc)
 	}
 	if *ta.tokenCalls == 0 {
 		t.Fatal("OAuth token endpoint was not called")
+	}
+	if !auth.HasToken() {
+		t.Fatal("token should be stored after successful callback")
+	}
+}
+
+func TestHandleCallbackLockedRejected(t *testing.T) {
+	ta := newTestApp(t)
+	ta.app.authToken = "secret"
+	ta.app.states.put("ok", "v")
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/oauth/callback?state=ok&code=abcd", nil)
+	r.AddCookie(&http.Cookie{Name: "whoop_oauth_state", Value: "ok"})
+	ta.app.handleCallback(w, r)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 without admin cookie", w.Code)
 	}
 }
 
 func TestHandleCallbackTokenExchangeError(t *testing.T) {
 	ta := newTestApp(t)
-	// Replace the token endpoint with one that errors.
 	ta.app.oauth = &oauth2.Config{
 		ClientID:     ta.app.oauth.ClientID,
 		ClientSecret: ta.app.oauth.ClientSecret,
@@ -604,14 +789,16 @@ func TestHandleCallbackTokenExchangeError(t *testing.T) {
 }
 
 func TestHandleCallbackPersistError(t *testing.T) {
+	skipIfRoot(t)
 	ta := newTestApp(t)
 	ta.app.states.put("ok", "v")
-	// Read-only store dir so any Put fails.
-	dir := ta.app.store.Dir()
-	if err := chmodRO(dir); err != nil {
+	// Point the token file at a path whose parent is read-only so SaveToken fails.
+	parent := t.TempDir()
+	if err := chmodRO(parent); err != nil {
 		t.Skipf("chmod RO not supported: %v", err)
 	}
-	t.Cleanup(func() { _ = chmodRW(dir) })
+	t.Cleanup(func() { _ = chmodRW(parent) })
+	t.Setenv("WHOOP_TOKEN_FILE", filepath.Join(parent, "nested", "token.json"))
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/oauth/callback?state=ok&code=abcd", nil)
 	r.AddCookie(&http.Cookie{Name: "whoop_oauth_state", Value: "ok"})
@@ -621,48 +808,37 @@ func TestHandleCallbackPersistError(t *testing.T) {
 	}
 }
 
-func TestHandleCallbackRandError(t *testing.T) {
+// ---- /mcp endpoint ----
+
+func TestHandleMCPNotConnected(t *testing.T) {
 	ta := newTestApp(t)
-	ta.app.states.put("ok", "v")
-	orig := storeNewID
-	t.Cleanup(func() { storeNewID = orig })
-	storeNewID = func() (string, error) { return "", errors.New("rand boom") }
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest("GET", "/oauth/callback?state=ok&code=abcd", nil)
-	r.AddCookie(&http.Cookie{Name: "whoop_oauth_state", Value: "ok"})
-	ta.app.handleCallback(w, r)
-	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d", w.Code)
+	ta.app.handleMCP(w, httptest.NewRequest("POST", "/mcp", nil))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 when no token stored", w.Code)
 	}
 }
 
-func TestHandleConnectBogusID(t *testing.T) {
+func TestHandleMCPBearerRequired(t *testing.T) {
 	ta := newTestApp(t)
+	ta.app.authToken = "secret"
+	ta.seedToken(t, nil)
 	w := httptest.NewRecorder()
-	ta.app.handleConnect(w, httptest.NewRequest("POST", "/connect/notreal", nil))
-	if w.Code != 404 {
-		t.Fatalf("status = %d", w.Code)
+	ta.app.handleMCP(w, httptest.NewRequest("POST", "/mcp", nil))
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 without bearer", w.Code)
 	}
 }
 
-func TestHandleConnectEmptyID(t *testing.T) {
+func TestHandleMCPRoutesToMCP(t *testing.T) {
 	ta := newTestApp(t)
-	w := httptest.NewRecorder()
-	ta.app.handleConnect(w, httptest.NewRequest("GET", "/connect/", nil))
-	if w.Code != 404 {
-		t.Fatalf("status = %d", w.Code)
-	}
-}
-
-func TestHandleConnectRoutesToMCP(t *testing.T) {
-	ta := newTestApp(t)
-	rec := ta.seedUser(t, "uid", nil)
+	ta.seedToken(t, nil)
 	body := strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}`)
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest("POST", "/connect/"+rec.ID, body)
+	r := httptest.NewRequest("POST", "/mcp", body)
 	r.Header.Set("Content-Type", "application/json")
 	r.Header.Set("Accept", "application/json, text/event-stream")
-	ta.app.handleConnect(w, r)
+	ta.app.handleMCP(w, r)
 	if w.Code != 200 {
 		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
 	}
@@ -671,29 +847,29 @@ func TestHandleConnectRoutesToMCP(t *testing.T) {
 	}
 }
 
-func TestHandleDisconnectBogusID(t *testing.T) {
+func TestHandleMCPRoutesWithBearer(t *testing.T) {
 	ta := newTestApp(t)
+	ta.app.authToken = "secret"
+	ta.seedToken(t, nil)
+	body := strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}`)
 	w := httptest.NewRecorder()
-	ta.app.handleDisconnect(w, httptest.NewRequest("GET", "/disconnect/notreal", nil))
-	if w.Code != 404 {
-		t.Fatalf("status = %d", w.Code)
+	r := httptest.NewRequest("POST", "/mcp", body)
+	r.Header.Set("Authorization", "Bearer secret")
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Accept", "application/json, text/event-stream")
+	ta.app.handleMCP(w, r)
+	if w.Code != 200 {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
 	}
 }
 
-func TestHandleDisconnectInvalidID(t *testing.T) {
-	ta := newTestApp(t)
-	w := httptest.NewRecorder()
-	ta.app.handleDisconnect(w, httptest.NewRequest("GET", "/disconnect/", nil))
-	if w.Code != 404 {
-		t.Fatalf("status = %d", w.Code)
-	}
-}
+// ---- disconnect ----
 
 func TestHandleDisconnectGETConfirmation(t *testing.T) {
 	ta := newTestApp(t)
-	rec := ta.seedUser(t, "uid", nil)
+	ta.seedToken(t, nil)
 	w := httptest.NewRecorder()
-	ta.app.handleDisconnect(w, httptest.NewRequest("GET", "/disconnect/"+rec.ID, nil))
+	ta.app.handleDisconnect(w, httptest.NewRequest("GET", "/disconnect", nil))
 	if w.Code != 200 {
 		t.Fatalf("status = %d", w.Code)
 	}
@@ -704,60 +880,80 @@ func TestHandleDisconnectGETConfirmation(t *testing.T) {
 
 func TestHandleDisconnectPOSTRevokesAndDeletes(t *testing.T) {
 	ta := newTestApp(t)
-	rec := ta.seedUser(t, "uid", nil)
+	ta.seedToken(t, nil)
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest("POST", "/disconnect/"+rec.ID, nil)
-	ta.app.handleDisconnect(w, r)
+	ta.app.handleDisconnect(w, httptest.NewRequest("POST", "/disconnect", nil))
 	if w.Code != 200 {
 		t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
 	}
 	if *ta.revokeCalls == 0 {
 		t.Fatal("Whoop revoke endpoint not called")
 	}
-	if _, err := ta.app.store.Get(rec.ID); !errors.Is(err, store.ErrNotFound) {
-		t.Fatal("record should be deleted")
+	if auth.HasToken() {
+		t.Fatal("token should be deleted")
 	}
 }
 
 func TestHandleDisconnectPOSTRevokeErrorStillDeletes(t *testing.T) {
 	ta := newTestApp(t)
-	// Point the whoop client at a server that returns 500 on revoke.
 	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "boom", 500)
 	}))
 	t.Cleanup(bad.Close)
 	ta.app.whoopBaseURL = bad.URL
-	rec := ta.seedUser(t, "uid", nil)
+	ta.seedToken(t, nil)
 	w := httptest.NewRecorder()
-	ta.app.handleDisconnect(w, httptest.NewRequest("POST", "/disconnect/"+rec.ID, nil))
+	ta.app.handleDisconnect(w, httptest.NewRequest("POST", "/disconnect", nil))
 	if w.Code != 200 {
 		t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
 	}
-	if _, err := ta.app.store.Get(rec.ID); !errors.Is(err, store.ErrNotFound) {
-		t.Fatal("record should be deleted even if revoke failed")
+	if auth.HasToken() {
+		t.Fatal("token should be deleted even if revoke failed")
+	}
+}
+
+func TestHandleDisconnectPOSTWhenNotConnected(t *testing.T) {
+	ta := newTestApp(t)
+	w := httptest.NewRecorder()
+	ta.app.handleDisconnect(w, httptest.NewRequest("POST", "/disconnect", nil))
+	if w.Code != 200 {
+		t.Fatalf("status = %d", w.Code)
 	}
 }
 
 func TestHandleDisconnectMethodNotAllowed(t *testing.T) {
 	ta := newTestApp(t)
-	rec := ta.seedUser(t, "uid", nil)
+	ta.seedToken(t, nil)
 	w := httptest.NewRecorder()
-	ta.app.handleDisconnect(w, httptest.NewRequest("PUT", "/disconnect/"+rec.ID, nil))
+	ta.app.handleDisconnect(w, httptest.NewRequest("PUT", "/disconnect", nil))
 	if w.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d", w.Code)
 	}
 }
 
-// ---- userTokenSource / persistingUserSource ----
-
-func TestPersistingUserSourcePersistsRefresh(t *testing.T) {
+func TestHandleDisconnectLockedRejected(t *testing.T) {
 	ta := newTestApp(t)
-	rec := ta.seedUser(t, "uid", &oauth2.Token{
+	ta.app.authToken = "secret"
+	w := httptest.NewRecorder()
+	ta.app.handleDisconnect(w, httptest.NewRequest("GET", "/disconnect", nil))
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", w.Code)
+	}
+}
+
+// ---- persistingTokenSource ----
+
+func TestPersistingTokenSourcePersistsRefresh(t *testing.T) {
+	ta := newTestApp(t)
+	ta.seedToken(t, &oauth2.Token{
 		AccessToken:  "old",
 		RefreshToken: "rt-old",
 		Expiry:       time.Now().Add(-time.Hour), // expired → triggers refresh
 	})
-	src := ta.app.userTokenSource(rec)
+	src, err := ta.app.tokenSource(context.Background())
+	if err != nil {
+		t.Fatalf("tokenSource: %v", err)
+	}
 	tok, err := src.Token()
 	if err != nil {
 		t.Fatalf("Token: %v", err)
@@ -765,21 +961,22 @@ func TestPersistingUserSourcePersistsRefresh(t *testing.T) {
 	if tok.AccessToken != "fresh" {
 		t.Fatalf("expected refreshed token, got %+v", tok)
 	}
-	updated, err := ta.app.store.Get(rec.ID)
+	loaded, err := auth.LoadToken()
 	if err != nil {
 		t.Fatalf("reload: %v", err)
 	}
-	if updated.Token.AccessToken != "fresh" {
-		t.Fatalf("store not updated: %+v", updated.Token)
+	if loaded.AccessToken != "fresh" {
+		t.Fatalf("store not updated: %+v", loaded)
 	}
 }
 
-func TestPersistingUserSourceNoOpForCachedToken(t *testing.T) {
+func TestPersistingTokenSourceNoOpForCachedToken(t *testing.T) {
 	ta := newTestApp(t)
-	rec := ta.seedUser(t, "uid", nil) // not expired
-	src := ta.app.userTokenSource(rec)
-	// Call twice; the underlying source should return the same cached token,
-	// and we should not invoke the OAuth token endpoint at all.
+	ta.seedToken(t, nil) // not expired
+	src, err := ta.app.tokenSource(context.Background())
+	if err != nil {
+		t.Fatalf("tokenSource: %v", err)
+	}
 	_, _ = src.Token()
 	_, _ = src.Token()
 	if *ta.tokenCalls != 0 {
@@ -787,86 +984,40 @@ func TestPersistingUserSourceNoOpForCachedToken(t *testing.T) {
 	}
 }
 
-func TestPersistingUserSourceErrorPropagates(t *testing.T) {
-	src := &persistingUserSource{base: &errSrc{err: errors.New("refresh failed")}, store: nil, id: "x"}
+func TestTokenSourceErrorsWhenNoToken(t *testing.T) {
+	ta := newTestApp(t)
+	if _, err := ta.app.tokenSource(context.Background()); err == nil {
+		t.Fatal("expected error when no token stored")
+	}
+}
+
+func TestPersistingTokenSourceErrorPropagates(t *testing.T) {
+	src := &persistingTokenSource{base: &errSrc{err: errors.New("refresh failed")}}
 	if _, err := src.Token(); err == nil || !strings.Contains(err.Error(), "refresh failed") {
 		t.Fatalf("expected refresh error, got %v", err)
 	}
 }
 
-func TestPersistingUserSourceStoreReloadError(t *testing.T) {
-	ta := newTestApp(t)
-	tok := &oauth2.Token{AccessToken: "new"}
-	src := &persistingUserSource{
-		base:  &staticTokenSrc{tok: tok},
-		store: ta.app.store,
-		id:    "missing",
-	}
-	if _, err := src.Token(); err == nil {
-		t.Fatal("expected error from store.Get of missing id")
-	}
-}
-
-func TestPersistingUserSourceStoreSaveError(t *testing.T) {
-	ta := newTestApp(t)
-	rec := ta.seedUser(t, "uid", &oauth2.Token{AccessToken: "old"})
-	// Now strip write permission on the store dir.
-	dir := ta.app.store.Dir()
-	if err := chmodRO(dir); err != nil {
+func TestPersistingTokenSourceSaveError(t *testing.T) {
+	skipIfRoot(t)
+	parent := t.TempDir()
+	t.Setenv("WHOOP_TOKEN_BACKEND", "file")
+	t.Setenv("WHOOP_TOKEN_FILE", filepath.Join(parent, "nested", "token.json"))
+	if err := chmodRO(parent); err != nil {
 		t.Skipf("chmod RO not supported: %v", err)
 	}
-	t.Cleanup(func() { _ = chmodRW(dir) })
-	src := &persistingUserSource{
-		base:  &staticTokenSrc{tok: &oauth2.Token{AccessToken: "new"}},
-		store: ta.app.store,
-		id:    rec.ID,
-	}
+	t.Cleanup(func() { _ = chmodRW(parent) })
+	src := &persistingTokenSource{base: &staticTokenSrc{tok: &oauth2.Token{AccessToken: "new"}}}
 	if _, err := src.Token(); err == nil {
 		t.Fatal("expected save error to surface")
 	}
 }
 
-// ---- Test scaffolding ----
-
-// buildMux mirrors what serveMultiTenant builds, so we can test the
-// routing in isolation.
-func buildMux(a *app) http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
-	mux.HandleFunc("/favicon.svg", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "image/svg+xml")
-		_, _ = w.Write([]byte(brandMarkSVG))
-	})
-	mux.Handle("/", securityHeaders(http.HandlerFunc(a.handleLanding)))
-	mux.Handle("/login", securityHeaders(http.HandlerFunc(a.handleLogin)))
-	mux.Handle("/oauth/callback", securityHeaders(http.HandlerFunc(a.handleCallback)))
-	mux.HandleFunc("/connect/", a.handleConnect)
-	mux.Handle("/disconnect/", securityHeaders(http.HandlerFunc(a.handleDisconnect)))
-	return mux
-}
-
-type fakeSrc struct{}
-
-func (fakeSrc) Token() (*oauth2.Token, error) {
-	return &oauth2.Token{AccessToken: "x", Expiry: time.Now().Add(time.Hour)}, nil
-}
-
-type staticTokenSrc struct{ tok *oauth2.Token }
-
-func (s *staticTokenSrc) Token() (*oauth2.Token, error) { return s.tok, nil }
-
-type errSrc struct{ err error }
-
-func (e *errSrc) Token() (*oauth2.Token, error) { return nil, e.err }
-
-// Keep io referenced when only used inline in a single test.
-var _ = io.Discard
-
-// ---- run() entry-point tests ----
+// ---- run() / serve() entry-point tests ----
 
 func resetEnv(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"WHOOP_CLIENT_ID", "WHOOP_CLIENT_SECRET", "WHOOP_REDIRECT_URI", "WHOOP_TOKEN_FILE", "WHOOP_INITIAL_REFRESH_TOKEN", "PORT", "MCP_HTTP_ADDR", "PUBLIC_URL", "USER_STORE_DIR"} {
+	for _, k := range []string{"WHOOP_CLIENT_ID", "WHOOP_CLIENT_SECRET", "WHOOP_REDIRECT_URI", "WHOOP_TOKEN_FILE", "WHOOP_TOKEN_BACKEND", "PORT", "MCP_HTTP_ADDR", "PUBLIC_URL", "AUTH_TOKEN"} {
 		t.Setenv(k, "")
 	}
 }
@@ -878,12 +1029,11 @@ func TestRunRejectsMissingCredentials(t *testing.T) {
 	}
 }
 
-func TestRunHTTPMode(t *testing.T) {
+func TestRunHTTPModeBootsAndCancels(t *testing.T) {
 	resetEnv(t)
 	t.Setenv("WHOOP_CLIENT_ID", "x")
 	t.Setenv("WHOOP_CLIENT_SECRET", "y")
-	t.Setenv("USER_STORE_DIR", t.TempDir())
-	t.Setenv("PUBLIC_URL", "http://127.0.0.1:0")
+	t.Setenv("WHOOP_TOKEN_FILE", filepath.Join(t.TempDir(), "token.json"))
 	t.Setenv("MCP_HTTP_ADDR", "127.0.0.1:0")
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -901,48 +1051,8 @@ func TestRunHTTPMode(t *testing.T) {
 	}
 }
 
-func TestRunStdioMissingToken(t *testing.T) {
-	resetEnv(t)
-	t.Setenv("WHOOP_CLIENT_ID", "x")
-	t.Setenv("WHOOP_CLIENT_SECRET", "y")
-	tokFile := filepath.Join(t.TempDir(), "missing.json")
-	t.Setenv("WHOOP_TOKEN_FILE", tokFile)
-	if err := run(context.Background()); err == nil {
-		t.Fatal("expected token-source error in stdio mode")
-	}
-}
-
-func TestRunStdioReturnsOnCancel(t *testing.T) {
-	resetEnv(t)
-	t.Setenv("WHOOP_CLIENT_ID", "x")
-	t.Setenv("WHOOP_CLIENT_SECRET", "y")
-	tokFile := filepath.Join(t.TempDir(), "token.json")
-	t.Setenv("WHOOP_TOKEN_FILE", tokFile)
-	if err := auth.SaveToken(&oauth2.Token{
-		AccessToken:  "x",
-		RefreshToken: "r",
-		Expiry:       time.Now().Add(time.Hour),
-	}); err != nil {
-		t.Fatalf("seed token: %v", err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- run(ctx) }()
-	time.Sleep(100 * time.Millisecond)
-	cancel()
-	select {
-	case <-done:
-		// Either nil or a stdin-closed error is fine — we just need run
-		// to return without hanging.
-	case <-time.After(3 * time.Second):
-		t.Fatal("run(stdio) did not return after cancel")
-	}
-}
-
 func TestMainInvokesRunAndExitsOnError(t *testing.T) {
 	resetEnv(t)
-	// Missing credentials → run() returns an error → main() should
-	// call osExit(1).
 	var exited int
 	origExit := osExit
 	t.Cleanup(func() { osExit = origExit })
@@ -953,23 +1063,124 @@ func TestMainInvokesRunAndExitsOnError(t *testing.T) {
 	}
 }
 
-func TestRunStdioSeedError(t *testing.T) {
-	resetEnv(t)
-	t.Setenv("WHOOP_CLIENT_ID", "x")
-	t.Setenv("WHOOP_CLIENT_SECRET", "y")
-	tokFile := filepath.Join(t.TempDir(), "missing.json")
-	t.Setenv("WHOOP_TOKEN_FILE", tokFile)
-	t.Setenv("WHOOP_INITIAL_REFRESH_TOKEN", "seed-rt")
-	// Make the parent dir read-only so SeedRefreshTokenIfMissing -> SaveToken fails.
-	parent := filepath.Dir(tokFile)
-	if err := chmodRO(parent); err != nil {
-		t.Skip("chmod RO not supported")
-	}
-	t.Cleanup(func() { _ = chmodRW(parent) })
-	if err := run(context.Background()); err == nil {
-		t.Fatal("expected seed token error")
+func TestServeBootsAndShutsDown(t *testing.T) {
+	t.Setenv("WHOOP_TOKEN_FILE", filepath.Join(t.TempDir(), "token.json"))
+	t.Setenv("PUBLIC_URL", "http://127.0.0.1:0")
+	ctx, cancel := context.WithCancel(context.Background())
+	cfg := &auth.Config{ClientID: "x", ClientSecret: "y", RedirectURL: "http://x/cb"}
+	done := make(chan error, 1)
+	go func() { done <- serve(ctx, "127.0.0.1:0", cfg) }()
+	time.Sleep(150 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("serve: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("serve did not shut down")
 	}
 }
+
+func TestServeRoutesReachable(t *testing.T) {
+	t.Setenv("WHOOP_TOKEN_FILE", filepath.Join(t.TempDir(), "token.json"))
+	t.Setenv("PUBLIC_URL", "")
+	cfg := &auth.Config{ClientID: "x", ClientSecret: "y", RedirectURL: "http://x/cb"}
+	ctx, cancel := context.WithCancel(context.Background())
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- serve(ctx, addr, cfg) }()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := http.Get("http://" + addr + "/healthz")
+		if err == nil {
+			_ = resp.Body.Close()
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	for _, path := range []string{"/healthz", "/favicon.svg", "/"} {
+		resp, err := http.Get("http://" + addr + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		if resp.StatusCode != 200 {
+			t.Fatalf("GET %s: status %d", path, resp.StatusCode)
+		}
+		_ = resp.Body.Close()
+	}
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("serve: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("serve did not shut down")
+	}
+}
+
+func TestServeListenError(t *testing.T) {
+	t.Setenv("WHOOP_TOKEN_FILE", filepath.Join(t.TempDir(), "token.json"))
+	t.Setenv("PUBLIC_URL", "http://127.0.0.1:0")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+	cfg := &auth.Config{ClientID: "x", ClientSecret: "y", RedirectURL: "http://x/cb"}
+	if err := serve(context.Background(), ln.Addr().String(), cfg); err == nil {
+		t.Fatal("expected listen error")
+	}
+}
+
+func TestResolveRedirectURI(t *testing.T) {
+	// Explicit value wins.
+	if got := resolveRedirectURI("127.0.0.1:0", "https://my.host", "https://override/cb"); got != "https://override/cb" {
+		t.Errorf("explicit: got %q", got)
+	}
+	// Derived from PUBLIC_URL.
+	if got := resolveRedirectURI("127.0.0.1:0", "https://my.host", ""); got != "https://my.host/oauth/callback" {
+		t.Errorf("public url: got %q", got)
+	}
+	// Falls back to a localhost callback using the listen port.
+	if got := resolveRedirectURI(":8080", "", ""); got != "http://localhost:8080/oauth/callback" {
+		t.Errorf("localhost fallback: got %q", got)
+	}
+}
+
+func TestNewWhoopClientUsesDefaultBaseURL(t *testing.T) {
+	a := &app{} // no whoopBaseURL set
+	c := a.newWhoopClient(context.Background(), &staticTokenSrc{tok: &oauth2.Token{AccessToken: "x"}})
+	if c == nil {
+		t.Fatal("expected client")
+	}
+}
+
+// ---- Test scaffolding ----
+
+type fakeSrc struct{}
+
+func (fakeSrc) Token() (*oauth2.Token, error) {
+	return &oauth2.Token{AccessToken: "x", Expiry: time.Now().Add(time.Hour)}, nil
+}
+
+type staticTokenSrc struct{ tok *oauth2.Token }
+
+func (s *staticTokenSrc) Token() (*oauth2.Token, error) { return s.tok, nil }
+
+type errSrc struct{ err error }
+
+func (e *errSrc) Token() (*oauth2.Token, error) { return nil, e.err }
+
+var _ = io.Discard
 
 // ---- Tool invocation tests via in-process MCP transport ----
 
@@ -1056,7 +1267,6 @@ func TestListToolInvalidTimeReturnsError(t *testing.T) {
 }
 
 func TestToolErrorsFromWhoop(t *testing.T) {
-	// Whoop server returns 500 for every path.
 	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "boom", 500)
 	}))
@@ -1139,151 +1349,5 @@ func TestListToolsInvalidTime(t *testing.T) {
 				t.Fatal("expected parse error")
 			}
 		})
-	}
-}
-
-func TestServeMultiTenantDefaultStoreDirAndRoutes(t *testing.T) {
-	// Default store dir kicks in when USER_STORE_DIR unset and writable. We
-	// can't actually use /data/users in CI; instead, leave USER_STORE_DIR
-	// pointing at a writable path so we cover the routes branch but
-	// exercise the default-dir branch separately with chmod RO.
-	t.Setenv("USER_STORE_DIR", t.TempDir())
-	t.Setenv("PUBLIC_URL", "http://127.0.0.1:0")
-	cfg := &auth.Config{ClientID: "x", ClientSecret: "y", RedirectURL: "http://x/cb"}
-	ctx, cancel := context.WithCancel(context.Background())
-
-	// Pick a port we control so we can hit it.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
-
-	errCh := make(chan error, 1)
-	go func() { errCh <- serveMultiTenant(ctx, addr, cfg) }()
-	// Poll the health endpoint until the server accepts requests.
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		resp, err := http.Get("http://" + addr + "/healthz")
-		if err == nil {
-			_ = resp.Body.Close()
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	// Exercise the inline route handlers.
-	for _, path := range []string{"/healthz", "/favicon.svg"} {
-		resp, err := http.Get("http://" + addr + path)
-		if err != nil {
-			t.Fatalf("GET %s: %v", path, err)
-		}
-		if resp.StatusCode != 200 {
-			t.Fatalf("GET %s: status %d", path, resp.StatusCode)
-		}
-		_ = resp.Body.Close()
-	}
-	cancel()
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Fatalf("serveMultiTenant: %v", err)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("serveMultiTenant did not shut down")
-	}
-}
-
-func TestServeMultiTenantDefaultStoreDir(t *testing.T) {
-	// Exercise the storeDir == "" branch. Default /data/users isn't
-	// writable, so we expect serveMultiTenant to return a store-creation
-	// error.
-	t.Setenv("USER_STORE_DIR", "")
-	t.Setenv("PUBLIC_URL", "https://example.test")
-	cfg := &auth.Config{ClientID: "x", ClientSecret: "y", RedirectURL: "http://x/cb"}
-	err := serveMultiTenant(context.Background(), "127.0.0.1:0", cfg)
-	if err == nil {
-		t.Skip("default /data/users is writable on this host; cannot exercise the failure branch")
-	}
-}
-
-func TestServeMultiTenantListenError(t *testing.T) {
-	t.Setenv("USER_STORE_DIR", t.TempDir())
-	t.Setenv("PUBLIC_URL", "http://127.0.0.1:0")
-	// Bind a socket so the address is in use, then try to start the server
-	// on the same address — ListenAndServe should fail.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	defer func() { _ = ln.Close() }()
-	cfg := &auth.Config{ClientID: "x", ClientSecret: "y", RedirectURL: "http://x/cb"}
-	if err := serveMultiTenant(context.Background(), ln.Addr().String(), cfg); err == nil {
-		t.Fatal("expected listen error")
-	}
-}
-
-// ---- Remaining branches ----
-
-func TestNewWhoopClientUsesDefaultBaseURL(t *testing.T) {
-	a := &app{} // no whoopBaseURL set
-	c := a.newWhoopClient(context.Background(), &staticTokenSrc{tok: &oauth2.Token{AccessToken: "x"}})
-	if c == nil {
-		t.Fatal("expected client")
-	}
-}
-
-func TestHandleConnectStripsSubPath(t *testing.T) {
-	ta := newTestApp(t)
-	rec := ta.seedUser(t, "uid", nil)
-	// MCP sessions use sub-paths; even a GET that doesn't initialize should
-	// at minimum route to the handler (which returns 4xx or 405) rather than
-	// landing in the 404 branch we already test.
-	w := httptest.NewRecorder()
-	ta.app.handleConnect(w, httptest.NewRequest("GET", "/connect/"+rec.ID+"/messages", nil))
-	if w.Code == 404 {
-		t.Fatalf("expected MCP handler routing, got 404")
-	}
-}
-
-func TestServeMultiTenantMissingPublicURL(t *testing.T) {
-	t.Setenv("USER_STORE_DIR", t.TempDir())
-	t.Setenv("PUBLIC_URL", "")
-	cfg := &auth.Config{ClientID: "x", ClientSecret: "y", RedirectURL: "http://x/cb"}
-	if err := serveMultiTenant(context.Background(), ":0", cfg); err == nil {
-		t.Fatal("expected error when PUBLIC_URL unset")
-	}
-}
-
-func TestServeMultiTenantStoreError(t *testing.T) {
-	parent := t.TempDir()
-	if err := chmodRO(parent); err != nil {
-		t.Skip("chmod RO not supported")
-	}
-	t.Cleanup(func() { _ = chmodRW(parent) })
-	t.Setenv("USER_STORE_DIR", filepath.Join(parent, "nested", "users"))
-	t.Setenv("PUBLIC_URL", "https://example.test")
-	cfg := &auth.Config{ClientID: "x", ClientSecret: "y", RedirectURL: "http://x/cb"}
-	if err := serveMultiTenant(context.Background(), ":0", cfg); err == nil {
-		t.Fatal("expected error when store dir cannot be created")
-	}
-}
-
-func TestServeMultiTenantBootsAndShutsDown(t *testing.T) {
-	t.Setenv("USER_STORE_DIR", t.TempDir())
-	t.Setenv("PUBLIC_URL", "http://127.0.0.1:0")
-	ctx, cancel := context.WithCancel(context.Background())
-	cfg := &auth.Config{ClientID: "x", ClientSecret: "y", RedirectURL: "http://x/cb"}
-	done := make(chan error, 1)
-	go func() { done <- serveMultiTenant(ctx, "127.0.0.1:0", cfg) }()
-	time.Sleep(150 * time.Millisecond) // let it bind
-	cancel()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("serveMultiTenant: %v", err)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("serveMultiTenant did not shut down")
 	}
 }

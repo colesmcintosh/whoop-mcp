@@ -109,13 +109,14 @@ func keyringAccount() string {
 	return keyringDefaultAcc
 }
 
-// userConfigDir, marshalIndent, keyringSet, keyringGet are swappable in
-// tests to exercise the OS- and encoding-level error paths.
+// userConfigDir, marshalIndent, keyringSet, keyringGet, keyringDelete are
+// swappable in tests to exercise the OS- and encoding-level error paths.
 var (
 	userConfigDir = os.UserConfigDir
 	marshalIndent = json.MarshalIndent
 	keyringSet    = keyring.Set
 	keyringGet    = keyring.Get
+	keyringDelete = keyring.Delete
 )
 
 // TokenStorePath returns the file-backend path where the token is
@@ -169,24 +170,32 @@ func SaveToken(tok *oauth2.Token) error {
 	return os.WriteFile(path, data, 0o600)
 }
 
-// SeedRefreshTokenIfMissing writes a token containing only the given
-// refresh token if no token is stored yet. On the first refresh, Whoop
-// will mint a fresh access+refresh token pair which the persisting token
-// source then writes back.
-//
-// This is the bootstrap mechanism for hosted deployments where running
-// the browser-based OAuth flow on the server is impractical: authorize
-// once locally with whoop-auth, copy the refresh_token into a Railway
-// env var, and the server will seed on first start.
-func SeedRefreshTokenIfMissing(refreshToken string) error {
-	if refreshToken == "" {
+// DeleteToken removes the stored token from the configured backend. It is
+// not an error to delete a token that does not exist. Used when the user
+// disconnects their Whoop account.
+func DeleteToken() error {
+	if ResolveBackend() == BackendKeyring {
+		if err := keyringDelete(keyringService, keyringAccount()); err != nil && !errors.Is(err, keyring.ErrNotFound) {
+			return err
+		}
 		return nil
 	}
-	if _, err := LoadToken(); err == nil {
-		return nil
+	path, err := TokenStorePath()
+	if err != nil {
+		return err
 	}
-	tok := &oauth2.Token{RefreshToken: refreshToken}
-	return SaveToken(tok)
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+// HasToken reports whether a token is currently stored. It is a thin
+// wrapper over LoadToken used by the server to decide whether the Whoop
+// account is connected yet.
+func HasToken() bool {
+	_, err := LoadToken()
+	return err == nil
 }
 
 // LoadToken reads a token previously saved with SaveToken.
@@ -243,7 +252,7 @@ func (p *persistingTokenSource) Token() (*oauth2.Token, error) {
 func (c *Config) TokenSource(ctx context.Context) (oauth2.TokenSource, error) {
 	tok, err := LoadToken()
 	if err != nil {
-		return nil, fmt.Errorf("load token (run whoop-auth first): %w", err)
+		return nil, fmt.Errorf("load token (connect your Whoop account at /login first): %w", err)
 	}
 	src := c.OAuth2Config().TokenSource(ctx, tok)
 	return &persistingTokenSource{src: src}, nil

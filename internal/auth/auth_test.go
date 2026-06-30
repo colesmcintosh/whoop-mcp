@@ -13,6 +13,15 @@ import (
 	"golang.org/x/oauth2"
 )
 
+// skipIfRoot skips tests that rely on filesystem permission denial, which
+// root bypasses (so a read-only directory is still writable).
+func skipIfRoot(t *testing.T) {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: chmod-based permission denial is ineffective")
+	}
+}
+
 // withMockKeyring swaps in an in-memory keyring for the test and clears
 // any prior entry under (service, account). It also flips the backend
 // env var to "keyring" for the test's duration.
@@ -156,6 +165,7 @@ func TestLoadTokenPropagatesPathError(t *testing.T) {
 }
 
 func TestSaveTokenPropagatesMkdirError(t *testing.T) {
+	skipIfRoot(t)
 	parent := t.TempDir()
 	if err := os.Chmod(parent, 0o500); err != nil {
 		t.Fatalf("chmod: %v", err)
@@ -254,6 +264,7 @@ func TestPersistingTokenSourcePropagatesError(t *testing.T) {
 }
 
 func TestPersistingTokenSourcePropagatesSaveError(t *testing.T) {
+	skipIfRoot(t)
 	parent := t.TempDir()
 	t.Setenv("WHOOP_TOKEN_FILE", filepath.Join(parent, "nested", "token.json"))
 	if err := os.Chmod(parent, 0o500); err != nil {
@@ -372,63 +383,68 @@ func TestKeyringLoadTokenParseError(t *testing.T) {
 	}
 }
 
-func TestKeyringSeedRefreshTokenIfMissing(t *testing.T) {
-	withMockKeyring(t)
-	if err := SeedRefreshTokenIfMissing("seed-rt"); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-	tok, err := LoadToken()
-	if err != nil {
-		t.Fatalf("LoadToken: %v", err)
-	}
-	if tok.RefreshToken != "seed-rt" {
-		t.Fatalf("RefreshToken = %q, want seed-rt", tok.RefreshToken)
-	}
-	// Existing entry: no overwrite.
-	if err := SeedRefreshTokenIfMissing("other-rt"); err != nil {
-		t.Fatalf("re-seed: %v", err)
-	}
-	tok2, _ := LoadToken()
-	if tok2.RefreshToken != "seed-rt" {
-		t.Fatalf("seed overwrote existing entry: %q", tok2.RefreshToken)
-	}
-}
-
 func TestErrNoTokenSentinelExported(t *testing.T) {
 	if ErrNoToken == nil || ErrNoToken.Error() == "" {
 		t.Fatal("ErrNoToken should be a non-nil sentinel")
 	}
 }
 
-func TestSeedRefreshTokenIfMissing(t *testing.T) {
+func TestDeleteTokenFile(t *testing.T) {
 	path := withTempTokenFile(t)
-
-	// Empty input is a no-op.
-	if err := SeedRefreshTokenIfMissing(""); err != nil {
-		t.Fatalf("empty seed: %v", err)
+	if err := SaveToken(&oauth2.Token{AccessToken: "a", RefreshToken: "r"}); err != nil {
+		t.Fatalf("SaveToken: %v", err)
+	}
+	if !HasToken() {
+		t.Fatal("HasToken should be true after SaveToken")
+	}
+	if err := DeleteToken(); err != nil {
+		t.Fatalf("DeleteToken: %v", err)
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("expected no token file after empty seed, stat err = %v", err)
+		t.Fatalf("token file should be gone, stat err = %v", err)
 	}
+	if HasToken() {
+		t.Fatal("HasToken should be false after DeleteToken")
+	}
+	// Deleting again is a no-op.
+	if err := DeleteToken(); err != nil {
+		t.Fatalf("second DeleteToken: %v", err)
+	}
+}
 
-	// Seeding when no file exists writes the refresh token.
-	if err := SeedRefreshTokenIfMissing("seed-rt"); err != nil {
-		t.Fatalf("seed: %v", err)
+func TestDeleteTokenFilePropagatesPathError(t *testing.T) {
+	t.Setenv("WHOOP_TOKEN_FILE", "")
+	orig := userConfigDir
+	t.Cleanup(func() { userConfigDir = orig })
+	userConfigDir = func() (string, error) { return "", errors.New("no config dir") }
+	if err := DeleteToken(); err == nil {
+		t.Fatal("expected delete error from path failure")
 	}
-	tok, err := LoadToken()
-	if err != nil {
-		t.Fatalf("LoadToken after seed: %v", err)
-	}
-	if tok.RefreshToken != "seed-rt" {
-		t.Fatalf("RefreshToken = %q, want %q", tok.RefreshToken, "seed-rt")
-	}
+}
 
-	// Seeding when a file already exists is a no-op (does not overwrite).
-	if err := SeedRefreshTokenIfMissing("different-rt"); err != nil {
-		t.Fatalf("seed-on-existing: %v", err)
+func TestDeleteTokenKeyring(t *testing.T) {
+	withMockKeyring(t)
+	if err := SaveToken(&oauth2.Token{AccessToken: "a"}); err != nil {
+		t.Fatalf("SaveToken: %v", err)
 	}
-	tok2, _ := LoadToken()
-	if tok2.RefreshToken != "seed-rt" {
-		t.Fatalf("seed overwrote existing token; got %q", tok2.RefreshToken)
+	if err := DeleteToken(); err != nil {
+		t.Fatalf("DeleteToken: %v", err)
+	}
+	if HasToken() {
+		t.Fatal("HasToken should be false after keyring DeleteToken")
+	}
+	// Deleting a missing keyring entry is a no-op.
+	if err := DeleteToken(); err != nil {
+		t.Fatalf("second keyring DeleteToken: %v", err)
+	}
+}
+
+func TestDeleteTokenKeyringError(t *testing.T) {
+	withMockKeyring(t)
+	orig := keyringDelete
+	t.Cleanup(func() { keyringDelete = orig })
+	keyringDelete = func(string, string) error { return errors.New("delete boom") }
+	if err := DeleteToken(); err == nil {
+		t.Fatal("expected keyring delete error to surface")
 	}
 }
