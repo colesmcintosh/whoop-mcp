@@ -14,38 +14,21 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v6
+      - uses: oven-sh/setup-bun@v2
         with:
-          go-version-file: go.mod
-          cache: true
+          bun-version: latest
 
-      - name: gofmt
-        run: |
-          out=$(gofmt -l .)
-          if [ -n "$out" ]; then
-            echo "Files need gofmt:"
-            echo "$out"
-            exit 1
-          fi
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
 
-      - name: go vet
-        run: go vet ./...
+      - name: Typecheck
+        run: bun run typecheck
 
-      - name: go test
-        run: go test -race -count=1 ./...
+      - name: Lint
+        run: bun run lint
 
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: true
-      - uses: golangci/golangci-lint-action@v9
-        with:
-          version: latest
-          args: --timeout=5m
+      - name: Test
+        run: bun test
 
   docker:
     runs-on: ubuntu-latest

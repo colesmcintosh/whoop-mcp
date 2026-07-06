@@ -1,51 +1,19 @@
 # whoop-mcp
 
 [![CI](https://github.com/colesmcintosh/whoop-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/colesmcintosh/whoop-mcp/actions/workflows/ci.yml)
-[![Go Reference](https://pkg.go.dev/badge/github.com/colesmcintosh/whoop-mcp.svg)](https://pkg.go.dev/github.com/colesmcintosh/whoop-mcp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 [![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new/template?template=https://github.com/colesmcintosh/whoop-mcp)
 
 A [Model Context Protocol](https://modelcontextprotocol.io) server for the
-[Whoop API v2](https://developer.whoop.com/), written in Go.
+[Whoop API v2](https://developer.whoop.com/), written in TypeScript for
+[Bun](https://bun.sh).
 
 Exposes recovery, sleep, cycles, workouts, profile, and body measurements as
-MCP tools so any MCP-capable AI assistant can read Whoop data on a user's
-behalf.
+MCP tools. It's single-tenant: you create your own Whoop developer app,
+authorize it yourself, and the server reads your Whoop data — there's no
+shared hosting or per-user login system.
 
-## Two modes
-
-`whoop-mcp` runs in one of two modes, selected by the environment.
-
-| Mode | When | Auth | How clients connect |
-| --- | --- | --- | --- |
-| **stdio** (default — no `PORT`/`MCP_HTTP_ADDR`) | Personal, single user, runs on your laptop | Local token file written by `whoop-auth` | The MCP client launches the binary as a subprocess |
-| **HTTP** (`PORT` or `MCP_HTTP_ADDR` set) | Hosted, multi-tenant | Per-user OAuth flow at `/login`; each user gets a private `/connect/<id>` URL | The MCP client connects over HTTPS to `/connect/<id>` |
-
-## HTTP mode (multi-tenant hosting)
-
-The hosted flow gives every visitor their own connector URL.
-
-```
-                 ┌──────────────────────────────┐
-                 │  https://your.host/login     │
-   User opens →  │  → Whoop OAuth consent       │
-                 │  → /oauth/callback           │
-                 │  → /connect/<id> shown       │
-                 └──────────────┬───────────────┘
-                                │ paste into
-                                ▼
-                 ┌──────────────────────────────┐
-                 │ Any MCP-capable client         │
-                 │ (Claude, etc.)                 │
-                 └──────────────┬───────────────┘
-                                │ HTTPS
-                                ▼
-                 ┌──────────────────────────────┐
-                 │ whoop-mcp /connect/<id>      │
-                 │ → looks up that user's token │
-                 │ → calls Whoop API            │
-                 └──────────────────────────────┘
-```
+## Setup
 
 ### 1. Create a Whoop app
 
@@ -53,92 +21,60 @@ Sign in at <https://developer-dashboard.whoop.com/apps/create>.
 
 - **Name**: anything (`whoop-mcp` works).
 - **Contacts**: your email.
-- **Privacy policy URL**: required by the form; link to your repo or hosted
-  privacy page.
-- **Redirect URLs**: add `https://<your-host>/oauth/callback` (and
-  `http://localhost:8080/oauth/callback` if you want local dev).
+- **Privacy policy URL**: required by the form; link to your repo or a
+  hosted privacy page.
+- **Redirect URLs**: `http://localhost:8080/oauth/callback`.
 - **Scopes**: enable `read:profile`, `read:body_measurement`, `read:cycles`,
   `read:recovery`, `read:sleep`, `read:workout`. (`offline` is requested by
-  the server at OAuth time and is not configurable on the dashboard.)
+  the client at OAuth time and isn't configurable on the dashboard.)
 
 Copy the **Client ID** and **Client Secret**.
 
-### 2. Configure
-
-| Env var | Required | Purpose |
-| --- | --- | --- |
-| `WHOOP_CLIENT_ID` | yes | From the Whoop dashboard. |
-| `WHOOP_CLIENT_SECRET` | yes | From the Whoop dashboard. |
-| `WHOOP_REDIRECT_URI` | yes (HTTP mode) | Must equal `<PUBLIC_URL>/oauth/callback`. |
-| `PUBLIC_URL` | yes (HTTP mode) | Externally reachable `https://` URL of the deployed server, no trailing slash. |
-| `USER_STORE_DIR` | optional | Where per-user JSON token files live. Default `/data/users`. Put this on persistent storage. |
-| `PORT` *or* `MCP_HTTP_ADDR` | yes (HTTP mode) | Listening address. Platforms like Railway set `PORT`. |
-| `WHOOP_TOKEN_BACKEND` | optional (stdio mode) | Where the local OAuth token is stored. `file` (default) writes JSON to `WHOOP_TOKEN_FILE`; `keyring` uses the OS keychain (macOS Keychain / GNOME Keyring / Windows Credential Manager). HTTP mode is unaffected — per-user tokens always live in `USER_STORE_DIR`. |
-| `WHOOP_KEYRING_ACCOUNT` | optional | Account name used inside the keychain entry. Defaults to `default`. Set this if you want multiple Whoop accounts on the same machine. |
-
-### 3. Deploy
-
-See [DEPLOY.md](./DEPLOY.md) for full step-by-step Railway and Docker
-instructions. Short version for Railway:
+### 2. Authorize once
 
 ```sh
-railway login
-railway init --name whoop-mcp
-railway add --service whoop-mcp \
-  --variables "WHOOP_CLIENT_ID=..." \
-  --variables "WHOOP_CLIENT_SECRET=..." \
-  --variables "WHOOP_REDIRECT_URI=https://<your>.up.railway.app/oauth/callback" \
-  --variables "PUBLIC_URL=https://<your>.up.railway.app"
-railway volume add --mount-path /data
-railway up
-railway domain
-```
-
-The included `Dockerfile` and `railway.toml` are picked up automatically.
-
-### 4. Connect
-
-Send users to `https://<your-host>/` — they click **Connect**, approve at
-Whoop, and the server hands them a personal `/connect/<id>` URL. They paste
-that URL into their MCP client.
-
-To revoke, a user visits `https://<your-host>/disconnect/<id>` (GET shows a
-confirmation, POST performs the revoke).
-
-## stdio mode (personal local use)
-
-If you don't want a hosted server and just want Whoop in your local Claude
-Code or Claude Desktop:
-
-```sh
-go build -o bin/whoop-mcp  ./cmd/whoop-mcp
-go build -o bin/whoop-auth ./cmd/whoop-auth
+git clone https://github.com/colesmcintosh/whoop-mcp.git
+cd whoop-mcp
+bun install
 
 export WHOOP_CLIENT_ID=...
 export WHOOP_CLIENT_SECRET=...
-./bin/whoop-auth                 # one-time OAuth (PKCE), persists token to ~/.config/whoop-mcp/token.json
+bun src/cli/whoop-auth.ts     # opens your browser, PKCE flow, saves the token
 ```
 
-To keep the token out of the filesystem entirely, store it in the OS
-keychain instead:
+The token is saved to `~/.config/whoop-mcp/token.json` (or wherever
+`WHOOP_TOKEN_FILE` points) and refreshed automatically from then on.
 
-```sh
-export WHOOP_TOKEN_BACKEND=keyring
-./bin/whoop-auth                 # writes to macOS Keychain / libsecret / Credential Manager
-./bin/whoop-mcp                  # reads from the same place
-```
-
-Then register the stdio server with Claude Code:
+### 3. Register the MCP server
 
 ```sh
 claude mcp add whoop \
   --env WHOOP_CLIENT_ID=$WHOOP_CLIENT_ID \
   --env WHOOP_CLIENT_SECRET=$WHOOP_CLIENT_SECRET \
-  -- $PWD/bin/whoop-mcp
+  -- bun $PWD/src/cli/whoop-mcp.ts
 ```
 
-For the personal stdio app, register `http://localhost:8080/callback` as the
-redirect URI on your Whoop app instead of (or in addition to) the hosted one.
+Any MCP client that can launch a subprocess (stdio transport) works the same
+way. Ask it something like "what's my latest recovery?"
+
+## Running it remotely (optional)
+
+`whoop-mcp` can also run as a single-tenant HTTP server — still one Whoop
+account, just reachable over the network instead of launched as a
+subprocess (useful for clients that can't spawn local processes, or hitting
+it from another device). Set `PORT` (or `MCP_HTTP_ADDR`) plus a bearer
+secret (`MCP_AUTH_TOKEN`) that gates the `/mcp` endpoint:
+
+```sh
+export MCP_AUTH_TOKEN=$(openssl rand -hex 32)
+export PORT=8080
+bun src/cli/whoop-mcp.ts
+```
+
+Point your client at `http://localhost:8080/mcp` with an `Authorization:
+Bearer $MCP_AUTH_TOKEN` header. See [DEPLOY.md](./DEPLOY.md) for deploying
+this on Railway or Docker, including how to seed the token store on a
+fresh volume.
 
 ## Tools exposed
 
@@ -159,30 +95,35 @@ redirect URI on your Whoop app instead of (or in addition to) the hosted one.
 List endpoints accept `limit` (1–25), `start`/`end` (RFC3339), and
 `next_token` for pagination.
 
+## Environment variables
+
+| Env var | Required | Purpose |
+| --- | --- | --- |
+| `WHOOP_CLIENT_ID` | yes | From the Whoop dashboard. |
+| `WHOOP_CLIENT_SECRET` | yes | From the Whoop dashboard. |
+| `WHOOP_REDIRECT_URI` | no | `whoop-auth` only. Defaults to `http://localhost:8080/oauth/callback`; must be `localhost`/`127.0.0.1`. |
+| `WHOOP_TOKEN_FILE` | no | Override the local token path. Default: platform config dir (e.g. `~/.config/whoop-mcp/token.json`), or `/data/token.json` in the Docker image. |
+| `PORT` / `MCP_HTTP_ADDR` | no | Set either to run in HTTP mode instead of stdio. `MCP_HTTP_ADDR` wins if both are set. |
+| `MCP_AUTH_TOKEN` | yes, in HTTP mode | Bearer secret required on every `/mcp` request. |
+| `WHOOP_REFRESH_TOKEN` | no | Seeds the token store on first boot in HTTP mode (e.g. a fresh Docker volume). See [DEPLOY.md](./DEPLOY.md). |
+
 ## Layout
 
 ```
-cmd/whoop-mcp     HTTP server + stdio MCP entry point
-cmd/whoop-auth    One-shot OAuth login CLI (stdio mode bootstrap)
-internal/auth     OAuth config, token storage, refreshing token source
-internal/store    Per-user filesystem token store
-internal/whoop    Whoop API v2 HTTP client
+src/cli/      whoop-mcp (stdio/HTTP entry point), whoop-auth (local OAuth bootstrap)
+src/auth/     OAuth+PKCE client, token storage, auto-refreshing token source
+src/whoop/    Whoop API v2 HTTP client
+src/mcp/      MCP tool registration
+src/http/     single-tenant HTTP transport (bearer-gated /mcp, /healthz)
 ```
-
-## Token rotation
-
-Whoop rotates the refresh token on every refresh — the previous one is
-invalidated immediately. Both modes persist the rotated token back to disk
-on every refresh, so this works across restarts as long as the storage
-location (`WHOOP_TOKEN_FILE` for stdio, `USER_STORE_DIR` for HTTP) is on
-persistent storage.
 
 ## Development
 
 ```sh
-go test ./...
-go vet ./...
-golangci-lint run        # optional, CI runs this
+bun install
+bun test
+bun run typecheck
+bun run lint
 docker build -t whoop-mcp .
 ```
 
@@ -190,12 +131,10 @@ docker build -t whoop-mcp .
 
 See [SECURITY.md](./SECURITY.md). Briefly:
 
-- The `/connect/<id>` URL **is** the credential — treat it like a password.
-- The OAuth state CSRF is in-memory; it survives a process lifetime but not
-  restarts (the OAuth flow recovers gracefully).
-- A baseline of HTTP security headers (CSP, X-Frame-Options, etc.) is set on
-  HTML responses.
-- `/login` is rate limited per IP.
+- `MCP_AUTH_TOKEN` **is** the credential in HTTP mode — treat it like a
+  password. Startup fails without it.
+- The OAuth flow uses PKCE; `whoop-auth` only accepts a localhost redirect.
+- The token file is written with `0600` permissions.
 
 ## License
 

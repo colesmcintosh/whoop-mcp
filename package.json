@@ -1,0 +1,30 @@
+{
+  "name": "whoop-mcp",
+  "version": "0.1.0",
+  "description": "A Model Context Protocol server for the Whoop API v2.",
+  "license": "MIT",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "whoop-mcp": "./src/cli/whoop-mcp.ts",
+    "whoop-auth": "./src/cli/whoop-auth.ts"
+  },
+  "scripts": {
+    "start": "bun src/cli/whoop-mcp.ts",
+    "auth": "bun src/cli/whoop-auth.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/bun": "^1.3.14",
+    "eslint": "^10.6.0",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.62.1"
+  }
+}
