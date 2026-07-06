@@ -1,17 +1,11 @@
 # Deploy
 
-`whoop-mcp` is a single static Go binary in a distroless container. It runs
-anywhere Docker runs and only needs one persistent volume (for the per-user
-token files).
+`whoop-mcp` is single-tenant: one deployment reads one Whoop account — yours.
+There's no server-side login flow or per-user credential store. You
+authorize locally once, then hand the deployment your own tokens as env
+vars.
 
-## Deploy on Railway (recommended)
-
-[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new/template?template=https://github.com/colesmcintosh/whoop-mcp)
-
-> The button above only works once the repo is public. While it's private,
-> follow the CLI steps below.
-
-### 1. Create your Whoop app
+## 1. Create your Whoop app
 
 At <https://developer-dashboard.whoop.com/apps/create>:
 
@@ -20,12 +14,25 @@ At <https://developer-dashboard.whoop.com/apps/create>:
 | Name | anything (`whoop-mcp` works) |
 | Contacts | your email |
 | Privacy policy URL | a link you control (your README works) |
-| Redirect URLs | `https://<your-host>/oauth/callback` — set after step 3 |
+| Redirect URLs | `http://localhost:8080/oauth/callback` |
 | Scopes | `read:profile`, `read:body_measurement`, `read:cycles`, `read:recovery`, `read:sleep`, `read:workout` |
 
 Copy the **Client ID** and **Client Secret**.
 
-### 2. Provision on Railway
+## 2. Authorize locally
+
+```sh
+export WHOOP_CLIENT_ID=...
+export WHOOP_CLIENT_SECRET=...
+bun src/cli/whoop-auth.ts
+```
+
+This opens your browser, completes the OAuth+PKCE flow, and saves a token to
+`~/.config/whoop-mcp/token.json` (or wherever `WHOOP_TOKEN_FILE` points). Open
+that file and copy the `refresh_token` value — that's what the deployment
+will use to bootstrap itself.
+
+## 3. Deploy on Railway
 
 ```sh
 git clone https://github.com/colesmcintosh/whoop-mcp.git
@@ -35,51 +42,37 @@ railway login
 railway init --name whoop-mcp
 railway add --service whoop-mcp \
   --variables "WHOOP_CLIENT_ID=<from step 1>" \
-  --variables "WHOOP_CLIENT_SECRET=<from step 1>"
+  --variables "WHOOP_CLIENT_SECRET=<from step 1>" \
+  --variables "WHOOP_REFRESH_TOKEN=<from step 2>" \
+  --variables "MCP_AUTH_TOKEN=<a long random string you generate>"
 railway volume add --mount-path /data
 railway up
+railway domain
 ```
 
-### 3. Get the public URL and wire callback
-
-```sh
-railway domain                    # mints a public https URL
-PUBLIC_URL=https://<that-domain>
-
-railway variables \
-  --set "PUBLIC_URL=$PUBLIC_URL" \
-  --set "WHOOP_REDIRECT_URI=$PUBLIC_URL/oauth/callback" \
-  --set "USER_STORE_DIR=/data/users"
-```
-
-Go back to the Whoop dashboard and add `$PUBLIC_URL/oauth/callback` to the
-app's **Redirect URLs**. Save.
-
-### 4. Verify
-
-```sh
-curl https://<your-host>/healthz       # → 200
-open https://<your-host>/              # → connect page
-```
-
-Click **Connect Whoop**, approve, and the success page shows your personal
-MCP URL. Paste it into any MCP client.
+`MCP_AUTH_TOKEN` is a shared secret you make up (e.g. `openssl rand -hex 32`)
+— it's the bearer token your MCP client will send. Treat it like a password;
+anyone who has it can read your Whoop data.
 
 ## Deploy with Docker (any host)
 
 ```sh
 docker build -t whoop-mcp .
 docker run --rm -p 8080:8080 \
+  -e PORT=8080 \
   -e WHOOP_CLIENT_ID=... \
   -e WHOOP_CLIENT_SECRET=... \
-  -e WHOOP_REDIRECT_URI=https://your.host/oauth/callback \
-  -e PUBLIC_URL=https://your.host \
+  -e WHOOP_REFRESH_TOKEN=... \
+  -e MCP_AUTH_TOKEN=... \
   -v whoop-data:/data \
   whoop-mcp
 ```
 
-Put a TLS-terminating reverse proxy (Caddy, nginx, Cloudflare Tunnel, etc.)
-in front of the container so `PUBLIC_URL` is reachable on https.
+## Connect an MCP client
+
+Point your client at `https://<your-host>/mcp` with an `Authorization: Bearer
+<MCP_AUTH_TOKEN>` header. `GET /healthz` (no auth) is what Railway/Docker
+should use for health checks.
 
 ## Environment variables
 
@@ -87,28 +80,22 @@ in front of the container so `PUBLIC_URL` is reachable on https.
 | --- | --- | --- |
 | `WHOOP_CLIENT_ID` | yes | From the Whoop developer dashboard. |
 | `WHOOP_CLIENT_SECRET` | yes | From the Whoop developer dashboard. |
-| `PUBLIC_URL` | yes | Externally-reachable `https://` URL of the server, no trailing slash. |
-| `WHOOP_REDIRECT_URI` | yes | Must equal `${PUBLIC_URL}/oauth/callback` and match a Whoop app redirect URI exactly. |
-| `PORT` | yes (or `MCP_HTTP_ADDR`) | Listening port. Railway/Fly/Render set this automatically. |
-| `USER_STORE_DIR` | no | Per-user token files. Default `/data/users`. Must live on a persistent volume. |
-| `MCP_HTTP_ADDR` | no | Override the listen address; e.g. `:8080`. Wins over `PORT`. |
+| `WHOOP_REFRESH_TOKEN` | first boot only | Seeds the token store from the local `whoop-auth` run. Ignored once a token file already exists on the volume. |
+| `MCP_AUTH_TOKEN` | yes | Bearer secret gating `/mcp`. Startup fails without it. |
+| `PORT` *or* `MCP_HTTP_ADDR` | yes | Listening address. Railway sets `PORT` automatically. |
+| `WHOOP_TOKEN_FILE` | no | Where the (continuously rotating) token is persisted. Defaults to `/data/token.json` in the image — must be on the mounted volume. |
+
+## Why a volume is required
+
+Whoop rotates the refresh token on every use. `WHOOP_REFRESH_TOKEN` only
+seeds the *first* boot; from then on, the server persists each newly-rotated
+token to `WHOOP_TOKEN_FILE`. Without a persistent volume, a restart would
+have only the stale env var and fail to reauthenticate.
 
 ## Post-deploy operations
 
-- **Rotate the client secret**: regenerate it on the Whoop dashboard, then
-  `railway variables --set "WHOOP_CLIENT_SECRET=<new>"`. Existing user
-  refresh tokens stay valid.
-- **Clear a user**: `rm /data/users/<id>.json` on the host, or visit
-  `/disconnect/<id>` in a browser.
-- **Rotate everything**: empty `/data/users/` — every visitor will need to
-  reconnect.
-
-## Updates
-
-```sh
-git pull
-railway up
-```
-
-Health check at `/healthz` keeps Railway from routing traffic to a failed
-deploy.
+- **Rotate the bearer secret**: generate a new one, `railway variables --set
+  "MCP_AUTH_TOKEN=<new>"`, and update your MCP client.
+- **Revoke Whoop access entirely**: visit your Whoop account's connected-apps
+  settings and revoke `whoop-mcp` there.
+- **Updates**: `git pull && railway up`.

@@ -1,12 +1,12 @@
 version: 2
 updates:
-  - package-ecosystem: gomod
+  - package-ecosystem: bun
     directory: /
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
     groups:
-      go-modules:
+      bun-deps:
         patterns:
           - "*"
 

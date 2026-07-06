@@ -4,3 +4,6 @@
 *.test
 *.out
 .railway-secrets
+node_modules/
+dist/
+*.tsbuildinfo

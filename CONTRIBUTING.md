@@ -5,11 +5,10 @@ Thanks for your interest in `whoop-mcp`.
 ## Quick start
 
 ```sh
-go mod download
-go test ./...
-go vet ./...
-gofmt -l .
-golangci-lint run        # optional but matches CI
+bun install
+bun test
+bun run typecheck
+bun run lint
 docker build -t whoop-mcp .
 ```
 
@@ -30,12 +29,13 @@ docker build -t whoop-mcp .
 
 ## Code expectations
 
-- Standard Go formatting (`gofmt`). CI fails on unformatted files.
-- New behavior comes with tests — see `internal/store/store_test.go` and
-  `internal/auth/auth_test.go` for the style.
-- Don't add dependencies for things the standard library already does well.
+- Standard TypeScript strict mode; `bun run typecheck` and `bun run lint`
+  must pass. CI runs both.
+- New behavior comes with tests — see `tests/` for the style (bun:test,
+  fixture HTTP servers for anything that talks to Whoop or the MCP client).
+- Don't add dependencies for things `fetch`/`node:*` already do well.
 - Don't introduce abstractions that aren't used by at least two callers.
-- Public functions and types should carry doc comments explaining their
+- Exported functions and types should carry doc comments explaining their
   contract — not their implementation.
 
 ## Security

@@ -6,3 +6,6 @@ bin/
 .railway-secrets
 .railwayignore
 Dockerfile.bak
+node_modules/
+dist/
+*.tsbuildinfo
