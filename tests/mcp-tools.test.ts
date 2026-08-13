@@ -48,6 +48,7 @@ describe("registerTools via a real MCP client", () => {
         "list_workouts",
       ].sort(),
     );
+    expect(tools.every((t) => t.annotations?.readOnlyHint === true)).toBe(true);
   });
 
   test("get_profile round-trips the Whoop API response as tool text content", async () => {
@@ -96,5 +97,12 @@ describe("registerTools via a real MCP client", () => {
         expect(result.isError).toBe(true);
       },
     );
+  });
+
+  test("list tools reject a limit outside 1-25", async () => {
+    const whoopClient = new WhoopClient({ getAccessToken: () => Promise.resolve("t") });
+    const client = await connectedClient(whoopClient);
+    const result = await client.callTool({ name: "list_cycles", arguments: { limit: 100 } });
+    expect(result.isError).toBe(true);
   });
 });

@@ -25,10 +25,12 @@ describe("WhoopClient", () => {
   test("sends Accept and bearer Authorization headers, returns raw JSON text", async () => {
     let capturedAuth: string | undefined;
     let capturedAccept: string | undefined;
+    let capturedUa: string | undefined;
     await withServer(
       (req, res) => {
         capturedAuth = req.headers.authorization;
         capturedAccept = req.headers.accept;
+        capturedUa = req.headers["user-agent"];
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
       },
@@ -40,6 +42,7 @@ describe("WhoopClient", () => {
     );
     expect(capturedAuth).toBe("Bearer abc123");
     expect(capturedAccept).toBe("application/json");
+    expect(capturedUa).toMatch(/^whoop-mcp\//);
   });
 
   test("throws an ApiError carrying the status code on non-2xx", async () => {
@@ -126,6 +129,48 @@ describe("WhoopClient", () => {
       },
     );
     expect(capturedUrl).toBe(`/v2/cycle/${encodeURIComponent("abc def/../x")}`);
+  });
+
+  test("retries once after 401 when the token source can invalidate", async () => {
+    const tokens = ["stale", "fresh"];
+    let tokenIndex = 0;
+    const source = {
+      getAccessToken: () => Promise.resolve(tokens[tokenIndex] ?? "fresh"),
+      invalidate: () => {
+        tokenIndex = 1;
+      },
+    };
+    const auths: string[] = [];
+    const statuses = [401, 200];
+    await withServer(
+      (req, res) => {
+        auths.push(req.headers.authorization ?? "");
+        const status = statuses.shift() ?? 200;
+        res.writeHead(status, { "Content-Type": "application/json" });
+        res.end(status === 200 ? JSON.stringify({ ok: true }) : "expired");
+      },
+      async (baseUrl) => {
+        const client = new WhoopClient(source, baseUrl);
+        const body = await client.getProfile();
+        expect(JSON.parse(body)).toEqual({ ok: true });
+      },
+    );
+    expect(auths).toEqual(["Bearer stale", "Bearer fresh"]);
+  });
+
+  test("does not retry 401 when the token source cannot invalidate", async () => {
+    await withServer(
+      (_req, res) => {
+        res.writeHead(401, { "Content-Type": "text/plain" });
+        res.end("expired");
+      },
+      async (baseUrl) => {
+        const client = new WhoopClient(fixedToken(), baseUrl);
+        const err = await client.getProfile().catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(ApiError);
+        expect((err as ApiError).statusCode).toBe(401);
+      },
+    );
   });
 
   test("revoke-free surface: all 11 read endpoints hit the expected paths", async () => {

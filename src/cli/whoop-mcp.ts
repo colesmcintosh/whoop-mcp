@@ -14,7 +14,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { loadConfigFromEnv } from "../auth/config.ts";
 import { createTokenSource } from "../auth/token-source.ts";
 import { seedFromRefreshTokenIfMissing, tokenExists } from "../auth/token-store.ts";
-import { createHttpApp } from "../http/server.ts";
+import { createHttpApp, parseListenAddr } from "../http/server.ts";
 import { createServer } from "../mcp/create-server.ts";
 import { WhoopClient } from "../whoop/client.ts";
 
@@ -27,10 +27,10 @@ async function main(): Promise<void> {
 
   const tokenSource = createTokenSource(config);
   const client = new WhoopClient(tokenSource);
-  const server = createServer(client);
 
   const addr = httpListenAddr();
   if (!addr) {
+    const server = createServer(client);
     await server.connect(new StdioServerTransport());
     return;
   }
@@ -39,8 +39,8 @@ async function main(): Promise<void> {
   if (!authToken) {
     throw new Error("MCP_AUTH_TOKEN must be set when running in HTTP mode");
   }
-  const app = await createHttpApp(server, { authToken });
-  const { host, port } = parseAddr(addr);
+  const app = createHttpApp(() => createServer(client), { authToken });
+  const { host, port } = parseListenAddr(addr);
   await new Promise<void>((resolve, reject) => {
     app.once("error", reject);
     app.listen(port, host, resolve);
@@ -50,13 +50,6 @@ async function main(): Promise<void> {
 
 function httpListenAddr(): string | undefined {
   return process.env.MCP_HTTP_ADDR || (process.env.PORT ? `:${process.env.PORT}` : undefined);
-}
-
-function parseAddr(addr: string): { host: string; port: number } {
-  const idx = addr.lastIndexOf(":");
-  const host = idx > 0 ? addr.slice(0, idx) : "0.0.0.0";
-  const port = Number(addr.slice(idx + 1));
-  return { host, port };
 }
 
 main().catch((err: unknown) => {

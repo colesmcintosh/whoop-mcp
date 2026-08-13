@@ -46,6 +46,7 @@ async function main(): Promise<void> {
   }
   if (token.refresh_token) {
     console.log("Refresh token stored — whoop-mcp will renew access tokens automatically.");
+    console.log("For a remote deploy, copy refresh_token from that file into WHOOP_REFRESH_TOKEN.");
   }
 }
 

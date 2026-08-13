@@ -57,6 +57,35 @@ describe("createTokenSource", () => {
     expect(persisted.refresh_token).toBe("r2");
   });
 
+  test("keeps the existing refresh token when the refresh response omits one", async () => {
+    const env = await tempEnv();
+    await saveToken(
+      { access_token: "old", refresh_token: "r1", expiry: new Date(Date.now() - 1000).toISOString() },
+      env,
+    );
+    globalThis.fetch = (() =>
+      Promise.resolve(jsonResponse({ access_token: "new", expires_in: 3600 }))) as unknown as typeof fetch;
+
+    const source = createTokenSource(config, env);
+    expect(await source.getAccessToken()).toBe("new");
+    expect((await loadToken(env)).refresh_token).toBe("r1");
+  });
+
+  test("invalidate forces a refresh even when the cached token is still valid", async () => {
+    const env = await tempEnv();
+    await saveToken(
+      { access_token: "still-valid", refresh_token: "r1", expiry: new Date(Date.now() + 60_000).toISOString() },
+      env,
+    );
+    globalThis.fetch = (() =>
+      Promise.resolve(jsonResponse({ access_token: "rotated", refresh_token: "r2", expires_in: 3600 }))) as unknown as typeof fetch;
+
+    const source = createTokenSource(config, env);
+    expect(await source.getAccessToken()).toBe("still-valid");
+    source.invalidate();
+    expect(await source.getAccessToken()).toBe("rotated");
+  });
+
   test("dedupes concurrent refreshes so a rotated refresh token is only spent once", async () => {
     const env = await tempEnv();
     await saveToken(

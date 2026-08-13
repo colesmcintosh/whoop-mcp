@@ -3,7 +3,10 @@
 // a language model without needing to stay in lockstep with Whoop's
 // evolving schema.
 
+import { SERVER_NAME, SERVER_VERSION } from "../version.ts";
+
 export const BASE_URL = "https://api.prod.whoop.com/developer";
+const USER_AGENT = `${SERVER_NAME}/${SERVER_VERSION}`;
 
 export class ApiError extends Error {
   readonly statusCode: number;
@@ -19,6 +22,8 @@ export class ApiError extends Error {
 
 export interface TokenSource {
   getAccessToken(): Promise<string>;
+  /** Drop any cached access token so the next call refreshes. */
+  invalidate?(): void;
 }
 
 export interface ListParams {
@@ -51,7 +56,7 @@ export class WhoopClient {
     private readonly baseUrl: string = BASE_URL,
   ) {}
 
-  private async get(path: string, query?: URLSearchParams): Promise<string> {
+  private async get(path: string, query?: URLSearchParams, retried = false): Promise<string> {
     const qs = query?.toString();
     const url = qs ? `${this.baseUrl}${path}?${qs}` : `${this.baseUrl}${path}`;
     const accessToken = await this.tokenSource.getAccessToken();
@@ -60,9 +65,14 @@ export class WhoopClient {
       headers: {
         Accept: "application/json",
         Authorization: `Bearer ${accessToken}`,
+        "User-Agent": USER_AGENT,
       },
     });
     const text = await res.text();
+    if (res.status === 401 && !retried && this.tokenSource.invalidate) {
+      this.tokenSource.invalidate();
+      return this.get(path, query, true);
+    }
     if (!res.ok) throw new ApiError(res.status, text);
     if (text.length === 0) throw new Error("empty response body");
     return text;
