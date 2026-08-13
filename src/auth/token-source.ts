@@ -18,11 +18,14 @@ function isValid(token: Token): boolean {
 
 export interface TokenSource {
   getAccessToken(): Promise<string>;
+  /** Force the next getAccessToken() call to refresh, ignoring expiry. */
+  invalidate(): void;
 }
 
 export function createTokenSource(config: Config, env: NodeJS.ProcessEnv = process.env): TokenSource {
   let cached: Token | null = null;
   let refreshing: Promise<Token> | null = null;
+  let forceRefresh = false;
 
   async function ensureLoaded(): Promise<Token> {
     if (!cached) {
@@ -41,6 +44,11 @@ export function createTokenSource(config: Config, env: NodeJS.ProcessEnv = proce
     if (!refreshing) {
       refreshing = (async () => {
         const refreshed = await refreshAccessToken(config, refreshToken);
+        // RFC 6749: refresh_token is optional in the response. Keep the
+        // current one unless Whoop rotated it.
+        if (!refreshed.refresh_token) {
+          refreshed.refresh_token = refreshToken;
+        }
         await saveToken(refreshed, env);
         cached = refreshed;
         return refreshed;
@@ -52,9 +60,13 @@ export function createTokenSource(config: Config, env: NodeJS.ProcessEnv = proce
   }
 
   return {
+    invalidate() {
+      forceRefresh = true;
+    },
     async getAccessToken(): Promise<string> {
       const token = await ensureLoaded();
-      if (isValid(token)) return token.access_token;
+      if (!forceRefresh && isValid(token)) return token.access_token;
+      forceRefresh = false;
       const refreshed = await refresh(token);
       return refreshed.access_token;
     },
