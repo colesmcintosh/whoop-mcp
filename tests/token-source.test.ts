@@ -86,6 +86,18 @@ describe("createTokenSource", () => {
     expect(await source.getAccessToken()).toBe("rotated");
   });
 
+  test("reload drops the cache so the next read comes from the store", async () => {
+    const env = await tempEnv();
+    const later = new Date(Date.now() + 60_000).toISOString();
+    await saveToken({ access_token: "a", refresh_token: "r1", expiry: later }, env);
+    const source = createTokenSource(config, env);
+    expect(await source.getAccessToken()).toBe("a");
+
+    await saveToken({ access_token: "b", refresh_token: "r2", expiry: later }, env);
+    source.reload();
+    expect(await source.getAccessToken()).toBe("b");
+  });
+
   test("dedupes concurrent refreshes so a rotated refresh token is only spent once", async () => {
     const env = await tempEnv();
     await saveToken(

@@ -5,6 +5,7 @@
 // hand-rolled here with fetch.
 
 import { AUTH_URL, DEFAULT_SCOPES, TOKEN_URL, type Config } from "./config.ts";
+import { generateCodeChallenge, generateCodeVerifier, generateState } from "./pkce.ts";
 
 // Field names mirror the Whoop token response (and golang.org/x/oauth2's
 // Token JSON encoding) so the persisted token file stays human-readable.
@@ -21,6 +22,14 @@ interface TokenResponse {
   token_type?: string;
   refresh_token?: string;
   expires_in?: number;
+}
+
+/** PKCE state, verifier, and the Whoop authorize URL to send the user to. */
+export function createAuthRequest(config: Config): { state: string; verifier: string; authUrl: string } {
+  const state = generateState();
+  const verifier = generateCodeVerifier();
+  const authUrl = buildAuthCodeUrl(config, { state, codeChallenge: generateCodeChallenge(verifier) });
+  return { state, verifier, authUrl };
 }
 
 export function buildAuthCodeUrl(

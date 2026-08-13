@@ -1,0 +1,25 @@
+# Self-host whoop-mcp: copy .env.example to .env, fill the three values,
+# then `docker compose up -d`. Open http://localhost:8080 to connect Whoop.
+
+services:
+  whoop-mcp:
+    build: .
+    image: whoop-mcp
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      WHOOP_CLIENT_ID: ${WHOOP_CLIENT_ID:?Set WHOOP_CLIENT_ID in .env}
+      WHOOP_CLIENT_SECRET: ${WHOOP_CLIENT_SECRET:?Set WHOOP_CLIENT_SECRET in .env}
+      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:?Set MCP_AUTH_TOKEN in .env (e.g. openssl rand -hex 32)}
+      WHOOP_REDIRECT_URI: ${WHOOP_REDIRECT_URI:-http://localhost:8080/oauth/callback}
+      WHOOP_REFRESH_TOKEN: ${WHOOP_REFRESH_TOKEN:-}
+      WHOOP_TOKEN_FILE: /data/token.json
+    volumes:
+      - whoop-data:/data
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  whoop-data:

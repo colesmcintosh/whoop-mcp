@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { loadConfigFromEnv } from "../src/auth/config.ts";
-import { buildAuthCodeUrl, exchangeCode, refreshAccessToken } from "../src/auth/oauth-client.ts";
+import { buildAuthCodeUrl, createAuthRequest, exchangeCode, refreshAccessToken } from "../src/auth/oauth-client.ts";
 
 const config = loadConfigFromEnv({
   WHOOP_CLIENT_ID: "id-123",
@@ -20,6 +20,18 @@ describe("buildAuthCodeUrl", () => {
     expect(url.searchParams.get("code_challenge")).toBe("challenge-1");
     expect(url.searchParams.get("code_challenge_method")).toBe("S256");
     expect(url.searchParams.get("scope")).toContain("offline");
+  });
+});
+
+describe("createAuthRequest", () => {
+  test("returns a state, verifier, and authorize URL", () => {
+    const req = createAuthRequest(config);
+    expect(req.state.length).toBeGreaterThan(8);
+    expect(req.verifier.length).toBeGreaterThan(8);
+    const url = new URL(req.authUrl);
+    expect(url.searchParams.get("state")).toBe(req.state);
+    expect(url.searchParams.get("code_challenge_method")).toBe("S256");
+    expect(url.searchParams.get("code_challenge")).toBeTruthy();
   });
 });
 

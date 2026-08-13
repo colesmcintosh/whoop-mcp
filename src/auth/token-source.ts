@@ -20,6 +20,8 @@ export interface TokenSource {
   getAccessToken(): Promise<string>;
   /** Force the next getAccessToken() call to refresh, ignoring expiry. */
   invalidate(): void;
+  /** Drop the in-memory token so the next read comes from the store. */
+  reload(): void;
 }
 
 export function createTokenSource(config: Config, env: NodeJS.ProcessEnv = process.env): TokenSource {
@@ -62,6 +64,10 @@ export function createTokenSource(config: Config, env: NodeJS.ProcessEnv = proce
   return {
     invalidate() {
       forceRefresh = true;
+    },
+    reload() {
+      cached = null;
+      forceRefresh = false;
     },
     async getAccessToken(): Promise<string> {
       const token = await ensureLoaded();

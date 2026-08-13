@@ -5,6 +5,7 @@
 # Higher-risk paths called out explicitly so reviewers can't drift later.
 /.github/               @colesmcintosh
 /Dockerfile             @colesmcintosh
+/docker-compose.yml     @colesmcintosh
 /SECURITY.md            @colesmcintosh
 /LICENSE                @colesmcintosh
 /src/auth/              @colesmcintosh
