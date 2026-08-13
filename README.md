@@ -21,52 +21,60 @@ cd whoop-mcp
 cp .env.example .env
 ```
 
-1. Create a Whoop app at <https://developer-dashboard.whoop.com/apps/create>
-   with redirect URL `http://localhost:8080/oauth/callback` and the read
-   scopes listed below. Copy the client ID and secret into `.env`.
-2. Set `MCP_AUTH_TOKEN` in `.env` to a long random string
-   (`openssl rand -hex 32`).
-3. Start it:
+### 1. Create a Whoop app
+
+At <https://developer-dashboard.whoop.com/apps/create>:
+
+| Field | Value |
+| --- | --- |
+| Name | anything (`whoop-mcp` works) |
+| Contacts | your email |
+| Privacy policy URL | a link you control (this README works) |
+| Redirect URLs | `http://localhost:8080/oauth/callback` |
+| Scopes | `read:profile`, `read:body_measurement`, `read:cycles`, `read:recovery`, `read:sleep`, `read:workout` (`offline` is requested at OAuth time and isn't on the dashboard) |
+
+Copy the **Client ID** and **Client Secret** into `.env`. Generate a bearer
+secret with `openssl rand -hex 32` and paste it as `MCP_AUTH_TOKEN` — treat
+it like a password:
+
+```
+WHOOP_CLIENT_ID=...
+WHOOP_CLIENT_SECRET=...
+MCP_AUTH_TOKEN=...
+```
+
+### 2. Start the container
 
 ```sh
 docker compose up -d
 ```
 
-4. Open <http://localhost:8080>, paste `MCP_AUTH_TOKEN`, and authorize with
-   Whoop. The token is stored on the `whoop-data` volume and refreshed
-   automatically after that.
+Open <http://localhost:8080>, paste `MCP_AUTH_TOKEN`, and authorize with
+Whoop. Tokens are stored on the `whoop-data` volume and refreshed
+automatically after that.
 
-Point your MCP client at `http://localhost:8080/mcp` with
-`Authorization: Bearer <MCP_AUTH_TOKEN>`. `GET /healthz` (no auth) is the
-health check.
+### 3. Point an MCP client at it
 
-On a remote host, set `WHOOP_REDIRECT_URI` to `https://<your-host>/oauth/callback`
-and add that same URL on the Whoop app. See [DEPLOY.md](./DEPLOY.md).
+```sh
+claude mcp add --transport http whoop http://localhost:8080/mcp \
+  --header "Authorization: Bearer $MCP_AUTH_TOKEN"
+```
+
+Any MCP client that speaks Streamable HTTP works the same way — URL
+`http://localhost:8080/mcp`, header `Authorization: Bearer <MCP_AUTH_TOKEN>`.
+`GET /healthz` (no auth) is the health check.
+
+On a remote host, set `WHOOP_REDIRECT_URI` to
+`https://<your-host>/oauth/callback` and register that same URL on the Whoop
+app. Railway, `docker run`, and reconnect/rotate notes are in
+[DEPLOY.md](./DEPLOY.md).
 
 ## Local stdio setup
 
-### 1. Create a Whoop app
-
-Sign in at <https://developer-dashboard.whoop.com/apps/create>.
-
-- **Name**: anything (`whoop-mcp` works).
-- **Contacts**: your email.
-- **Privacy policy URL**: required by the form; link to your repo or a
-  hosted privacy page.
-- **Redirect URLs**: `http://localhost:8080/oauth/callback`.
-- **Scopes**: enable `read:profile`, `read:body_measurement`, `read:cycles`,
-  `read:recovery`, `read:sleep`, `read:workout`. (`offline` is requested by
-  the client at OAuth time and isn't configurable on the dashboard.)
-
-Copy the **Client ID** and **Client Secret**.
-
-### 2. Authorize once
+Same Whoop app as above. Then, without Docker:
 
 ```sh
-git clone https://github.com/colesmcintosh/whoop-mcp.git
-cd whoop-mcp
 bun install
-
 export WHOOP_CLIENT_ID=...
 export WHOOP_CLIENT_SECRET=...
 bun src/cli/whoop-auth.ts     # opens your browser, PKCE flow, saves the token
@@ -74,8 +82,6 @@ bun src/cli/whoop-auth.ts     # opens your browser, PKCE flow, saves the token
 
 The token is saved to `~/.config/whoop-mcp/token.json` (or wherever
 `WHOOP_TOKEN_FILE` points) and refreshed automatically from then on.
-
-### 3. Register the MCP server
 
 ```sh
 claude mcp add whoop \
@@ -87,12 +93,7 @@ claude mcp add whoop \
 Any MCP client that can launch a subprocess (stdio transport) works the same
 way. Ask it something like "what's my latest recovery?"
 
-## Running it remotely without Docker
-
-`whoop-mcp` can also run as a single-tenant HTTP server — still one Whoop
-account, just reachable over the network instead of launched as a
-subprocess. Set `PORT` (or `MCP_HTTP_ADDR`) plus a bearer secret
-(`MCP_AUTH_TOKEN`) that gates the `/mcp` endpoint:
+## Running HTTP mode without Docker
 
 ```sh
 export MCP_AUTH_TOKEN=$(openssl rand -hex 32)
@@ -100,10 +101,8 @@ export PORT=8080
 bun src/cli/whoop-mcp.ts
 ```
 
-Then open `http://localhost:8080` to connect Whoop, or seed
-`WHOOP_REFRESH_TOKEN` from a prior `whoop-auth` run. Point your client at
-`http://localhost:8080/mcp` with an `Authorization: Bearer $MCP_AUTH_TOKEN`
-header. See [DEPLOY.md](./DEPLOY.md) for Railway.
+Open `http://localhost:8080` to connect Whoop, then point your client at
+`http://localhost:8080/mcp` with `Authorization: Bearer $MCP_AUTH_TOKEN`.
 
 ## Tools exposed
 
