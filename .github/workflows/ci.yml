@@ -46,10 +46,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: docker/setup-buildx-action@v4
+
       - name: Build image
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          push: false
-          tags: whoop-mcp:ci
+        run: docker build -t whoop-mcp:ci .
+
+      - name: Smoke test HTTP setup
+        run: |
+          docker run -d --name whoop-mcp-ci -p 18080:8080 \
+            -e WHOOP_CLIENT_ID=ci \
+            -e WHOOP_CLIENT_SECRET=ci \
+            -e MCP_AUTH_TOKEN=ci-secret \
+            whoop-mcp:ci
+          trap 'docker logs whoop-mcp-ci; docker rm -f whoop-mcp-ci' EXIT
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:18080/healthz && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:18080/healthz | grep -qx ok
+          curl -fsS http://127.0.0.1:18080/ | grep -q "Connect Whoop"
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18080/mcp)
+          test "$code" = "401"
+
+      - name: Validate compose file
+        run: |
+          WHOOP_CLIENT_ID=ci WHOOP_CLIENT_SECRET=ci MCP_AUTH_TOKEN=ci \
+            docker compose config >/dev/null

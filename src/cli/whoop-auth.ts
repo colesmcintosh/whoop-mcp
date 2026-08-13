@@ -6,8 +6,7 @@
 
 import { createServer, type Server } from "node:http";
 import { loadConfigFromEnv } from "../auth/config.ts";
-import { buildAuthCodeUrl, exchangeCode } from "../auth/oauth-client.ts";
-import { generateCodeChallenge, generateCodeVerifier, generateState } from "../auth/pkce.ts";
+import { createAuthRequest, exchangeCode } from "../auth/oauth-client.ts";
 import { saveToken, tokenStoreLocation } from "../auth/token-store.ts";
 import { openBrowser } from "./open-browser.ts";
 
@@ -28,10 +27,7 @@ async function main(): Promise<void> {
   const port = redirectUrl.port ? Number(redirectUrl.port) : 80;
   const callbackPath = redirectUrl.pathname || "/";
 
-  const state = generateState();
-  const verifier = generateCodeVerifier();
-  const codeChallenge = generateCodeChallenge(verifier);
-  const authUrl = buildAuthCodeUrl(config, { state, codeChallenge });
+  const { state, verifier, authUrl } = createAuthRequest(config);
 
   const code = await waitForCallback({ hostname: redirectUrl.hostname, port, callbackPath, state, authUrl });
 

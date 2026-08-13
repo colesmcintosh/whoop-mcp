@@ -1,23 +1,37 @@
 // Single-tenant HTTP transport for whoop-mcp. There is exactly one Whoop
 // account behind this server (see src/auth); this module only adds a
 // remotely-reachable transport in front of it, gated by a static bearer
-// secret. There is no per-user OAuth flow or credential storage here.
+// secret. Browser OAuth (when `oauth` is set) is how that one account
+// connects; it is not a multi-user login system.
 //
 // Each MCP client session gets its own McpServer + Streamable HTTP
 // transport. Sharing one transport across clients (or reconnects) makes
 // the second initialize fail.
 
-import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+import {
+  OAUTH_START_PATH,
+  SETUP_PATH,
+  setupPage,
+  statusPage,
+  writeHtml,
+  type OAuthSetup,
+} from "./oauth-setup.ts";
+import { timingSafeEqualStrings } from "./secret.ts";
 
 export const MCP_PATH = "/mcp";
 export const HEALTH_PATH = "/healthz";
 
 export interface HttpServerOptions {
   authToken: string;
+  /** When false, /mcp returns 503 until a Whoop token is stored. */
+  isReady?: () => Promise<boolean>;
+  /** Browser OAuth+PKCE setup for Docker/HTTP deploys. */
+  oauth?: OAuthSetup;
 }
 
 interface Session {
@@ -66,6 +80,32 @@ async function handleRequest(
     return;
   }
 
+  if (opts.oauth) {
+    const callbackPath = opts.oauth.callbackPath();
+    const isCallback =
+      url.pathname === callbackPath &&
+      req.method === "GET" &&
+      (url.searchParams.has("code") || url.searchParams.has("error") || url.searchParams.has("state"));
+    if (isCallback) {
+      await opts.oauth.handleCallback(url, res);
+      return;
+    }
+    if (url.pathname === OAUTH_START_PATH && req.method === "POST") {
+      await opts.oauth.handleStart(req, res);
+      return;
+    }
+    if (url.pathname === SETUP_PATH && req.method === "GET") {
+      writeHtml(res, 200, setupPage());
+      return;
+    }
+  }
+
+  if (url.pathname === "/" && req.method === "GET") {
+    const ready = opts.isReady ? await opts.isReady() : true;
+    writeHtml(res, 200, statusPage(ready, Boolean(opts.oauth)));
+    return;
+  }
+
   if (url.pathname !== MCP_PATH) {
     res.writeHead(404, { "Content-Type": "text/plain" });
     res.end("not found");
@@ -75,6 +115,12 @@ async function handleRequest(
   if (!isAuthorized(req, opts.authToken)) {
     res.writeHead(401, { "Content-Type": "text/plain", "WWW-Authenticate": "Bearer" });
     res.end("unauthorized");
+    return;
+  }
+
+  if (opts.isReady && !(await opts.isReady())) {
+    res.writeHead(503, { "Content-Type": "text/plain" });
+    res.end("whoop-mcp: not connected to Whoop yet; open / in a browser to authorize");
     return;
   }
 
@@ -153,11 +199,6 @@ function isAuthorized(req: IncomingMessage, authToken: string): boolean {
   const header = req.headers.authorization;
   if (!header?.startsWith("Bearer ")) return false;
   return timingSafeEqualStrings(header.slice("Bearer ".length), authToken);
-}
-
-function timingSafeEqualStrings(a: string, b: string): boolean {
-  const digest = (value: string) => createHash("sha256").update(value).digest();
-  return timingSafeEqual(digest(a), digest(b));
 }
 
 function headerValue(value: string | string[] | undefined): string | undefined {

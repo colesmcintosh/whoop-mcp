@@ -9,7 +9,7 @@ bun install
 bun test
 bun run typecheck
 bun run lint
-docker build -t whoop-mcp .
+docker compose up --build
 ```
 
 ## Branch and commit style
