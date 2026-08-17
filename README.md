@@ -51,14 +51,21 @@ docker compose up -d
 
 Open <http://localhost:8080>, paste `MCP_AUTH_TOKEN`, and authorize with
 Whoop. Tokens are stored on the `whoop-data` volume and refreshed
-automatically after that.
+automatically after that. Until you authorize, `/mcp` returns `503`.
+Reconnect later at `/setup`.
 
 ### 3. Point an MCP client at it
 
 The endpoint is [Streamable HTTP](https://modelcontextprotocol.io/docs/concepts/transports):
 each client gets its own MCP session (keyed by `mcp-session-id`), so a second
 client or a reconnect after `initialize` does not collide with the first.
-`GET /healthz` is unauthenticated and returns `ok`.
+
+| Path | Auth | Purpose |
+| --- | --- | --- |
+| `GET /healthz` | none | liveness; body is `ok` |
+| `GET /` | none | status page, or the setup form if Whoop isn't connected |
+| `GET /setup` | none to view | reconnect form; starting OAuth requires `MCP_AUTH_TOKEN` |
+| `/mcp` | `Authorization: Bearer <MCP_AUTH_TOKEN>` | MCP; `503` until Whoop is connected, `401` if the bearer is wrong |
 
 **Claude Code:**
 
@@ -75,7 +82,7 @@ claude mcp add --transport http whoop http://localhost:8080/mcp \
     "whoop": {
       "url": "http://localhost:8080/mcp",
       "headers": {
-        "Authorization": "Bearer <MCP_AUTH_TOKEN>"
+        "Authorization": "Bearer ${env:MCP_AUTH_TOKEN}"
       }
     }
   }
@@ -87,8 +94,8 @@ Any MCP client that speaks Streamable HTTP works the same way — URL
 
 On a remote host, set `WHOOP_REDIRECT_URI` to
 `https://<your-host>/oauth/callback` and register that same URL on the Whoop
-app. Railway, `docker run`, and reconnect/rotate notes are in
-[DEPLOY.md](./DEPLOY.md).
+app. Railway (including the volume UID the image needs), `docker run`, and
+reconnect/rotate notes are in [DEPLOY.md](./DEPLOY.md).
 
 ## Local stdio setup
 
@@ -124,7 +131,9 @@ claude mcp add whoop \
   -- bun $PWD/src/cli/whoop-mcp.ts
 ```
 
-**Cursor** (project `.cursor/mcp.json` or `~/.cursor/mcp.json`):
+**Cursor** (project `.cursor/mcp.json` or `~/.cursor/mcp.json`) and
+**Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json`
+on macOS, `%APPDATA%\Claude\claude_desktop_config.json` on Windows):
 
 ```json
 {
@@ -156,7 +165,8 @@ bun start
 
 Open `http://localhost:8080` to connect Whoop, then point your client at
 `http://localhost:8080/mcp` with `Authorization: Bearer $MCP_AUTH_TOKEN`
-(same Cursor JSON as the Docker section above).
+(same Cursor JSON as the Docker section above). `/mcp` returns `503` until
+Whoop is connected.
 
 ## Tools exposed
 
