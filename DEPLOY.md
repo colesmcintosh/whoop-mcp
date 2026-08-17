@@ -37,6 +37,7 @@ docker compose up -d
 
 Open <http://localhost:8080>, paste `MCP_AUTH_TOKEN`, and authorize. Whoop
 tokens live on the `whoop-data` volume and are refreshed automatically.
+`/mcp` returns `503` until that first authorization.
 
 Point your MCP client at `http://localhost:8080/mcp` with
 `Authorization: Bearer <MCP_AUTH_TOKEN>`. `GET /healthz` (no auth) is the
@@ -58,8 +59,10 @@ loses the rotated token and you have to reconnect.
 
 ## 3. Deploy on Railway
 
-Authorize once locally (or use the HTTP setup page after the first deploy),
-then:
+The README button (or `railway up` from a clone) builds the Dockerfile. You
+still need secrets, a volume at `/data`, and the OAuth callback URL. The
+image runs as `bun`; Railway volumes are root-owned, so set
+`RAILWAY_RUN_UID=0` or the token file cannot be written.
 
 ```sh
 git clone https://github.com/colesmcintosh/whoop-mcp.git
@@ -70,16 +73,25 @@ railway init --name whoop-mcp
 railway add --service whoop-mcp \
   --variables "WHOOP_CLIENT_ID=<from step 1>" \
   --variables "WHOOP_CLIENT_SECRET=<from step 1>" \
-  --variables "MCP_AUTH_TOKEN=<a long random string you generate>"
+  --variables "MCP_AUTH_TOKEN=$(openssl rand -hex 32)" \
+  --variables "RAILWAY_RUN_UID=0"
 railway volume add --mount-path /data
 railway up
 railway domain
 ```
 
+Then:
+
+```sh
+railway variable set WHOOP_REDIRECT_URI=https://<railway-domain>/oauth/callback
+```
+
+Register that same callback on the Whoop app. Open the deployment URL, paste
+`MCP_AUTH_TOKEN`, and authorize. `railway.toml` already health-checks
+`/healthz`.
+
 Optional: set `WHOOP_REFRESH_TOKEN` to skip the browser setup on a fresh
-volume (copy `refresh_token` from a local `whoop-auth` token file). Set
-`WHOOP_REDIRECT_URI` to `https://<railway-domain>/oauth/callback` if you
-want to authorize through the deployed setup page instead.
+volume (copy `refresh_token` from a local `whoop-auth` token file).
 
 ## Docker without Compose
 
@@ -106,19 +118,21 @@ Point your client at `https://<your-host>/mcp` with an `Authorization: Bearer
 | --- | --- | --- |
 | `WHOOP_CLIENT_ID` | yes | From the Whoop developer dashboard. |
 | `WHOOP_CLIENT_SECRET` | yes | From the Whoop developer dashboard. |
-| `MCP_AUTH_TOKEN` | yes | Bearer secret gating `/mcp` and the setup form. Startup fails without it. |
+| `MCP_AUTH_TOKEN` | yes | Bearer secret gating `/mcp` and starting the setup flow. Startup fails without it. |
 | `PORT` *or* `MCP_HTTP_ADDR` | yes | Listening address. The Docker image and Railway both set `PORT`. |
 | `WHOOP_REDIRECT_URI` | no | OAuth callback. Default `http://localhost:8080/oauth/callback`. |
 | `WHOOP_REFRESH_TOKEN` | first boot only, optional | Seeds the token store if you already ran `whoop-auth`. Ignored once a token file exists. |
 | `WHOOP_TOKEN_FILE` | no | Where the (continuously rotating) token is persisted. Defaults to `/data/token.json` in the image — must be on the mounted volume. |
+| `RAILWAY_RUN_UID` | Railway only | Set to `0`. The image runs as `bun`; Railway volumes are root-owned. |
 
 ## Post-deploy operations
 
 - **Rotate the bearer secret**: generate a new one, update `.env` (or
-  `railway variables --set "MCP_AUTH_TOKEN=<new>"`), recreate the container,
-  and update your MCP client.
+  `railway variable set MCP_AUTH_TOKEN=<new>`), recreate the container, and
+  update your MCP client.
 - **Reconnect Whoop**: open `/setup` and authorize again (needs
-  `MCP_AUTH_TOKEN`).
+  `MCP_AUTH_TOKEN` to start the flow). `/mcp` returns `503` until a token is
+  stored.
 - **Revoke Whoop access entirely**: visit your Whoop account's connected-apps
   settings and revoke `whoop-mcp` there.
 - **Updates**: `git pull && docker compose up -d --build` (or `railway up`).

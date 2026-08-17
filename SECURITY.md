@@ -29,10 +29,11 @@ is no multi-user credential store.
   exchanged without the per-flow code verifier held in memory.
 - `whoop-auth` only accepts a `localhost`/`127.0.0.1` redirect URI — it
   can't be pointed at a remote callback.
-- In HTTP/Docker mode, starting the browser setup flow requires
-  `MCP_AUTH_TOKEN`. The callback is bound to a single in-memory PKCE
-  session (5 minute TTL). Set `WHOOP_REDIRECT_URI` to the public URL you
-  registered on the Whoop app if the server isn't reached as localhost.
+- In HTTP/Docker mode, `GET /` and `GET /setup` are unauthenticated HTML
+  (no Whoop data). Starting the browser setup flow (`POST /oauth/start`)
+  requires `MCP_AUTH_TOKEN`. The callback is bound to a single in-memory
+  PKCE session (5 minute TTL). Set `WHOOP_REDIRECT_URI` to the public URL
+  you registered on the Whoop app if the server isn't reached as localhost.
 - The locally/volume-persisted OAuth token (`WHOOP_TOKEN_FILE`) is written
   with `0600` permissions. Anyone with filesystem access to that path can
   read it.
@@ -42,8 +43,9 @@ is no multi-user credential store.
   Startup fails if it isn't set, so an HTTP deployment can't accidentally
   run unauthenticated.
 - `/healthz` is intentionally unauthenticated (health checks need to reach
-  it) and returns no Whoop data. `/` is a status/setup page and does not
-  expose Whoop data.
+  it) and returns no Whoop data. `/` and `/setup` are status/setup pages
+  and do not expose Whoop data. `/mcp` returns `503` until a Whoop token
+  is stored, then requires the bearer secret.
 
 ## Out of scope
 

@@ -30,7 +30,8 @@ docker compose up --build
 ## Code expectations
 
 - Standard TypeScript strict mode; `bun run typecheck` and `bun run lint`
-  must pass. CI runs both.
+  must pass. CI runs typecheck, tests, lint, and a Docker image smoke test
+  (`/healthz`, the setup page, and that `/mcp` is gated).
 - New behavior comes with tests — see `tests/` for the style (bun:test,
   fixture HTTP servers for anything that talks to Whoop or the MCP client).
 - Don't add dependencies for things `fetch`/`node:*` already do well.
