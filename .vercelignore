@@ -1,0 +1,8 @@
+# Vercel builds api/index.ts, which imports src/. Everything else is ballast.
+.github/
+tests/
+Dockerfile
+docker-compose.yml
+*.md
+.editorconfig
+eslint.config.js

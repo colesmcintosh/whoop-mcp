@@ -18,7 +18,7 @@ function stubClient(): WhoopClient {
 async function withApp(
   authToken: string,
   fn: (baseUrl: string) => Promise<void>,
-  extra?: { isReady?: () => Promise<boolean>; oauth?: OAuthSetup },
+  extra?: { isReady?: () => Promise<boolean>; oauth?: OAuthSetup; stateless?: boolean },
 ): Promise<void> {
   const app: Server = createHttpApp(() => createMcpServer(stubClient()), { authToken, ...extra });
   await new Promise<void>((resolve) => app.listen(0, "127.0.0.1", resolve));
@@ -57,6 +57,11 @@ const initBody = {
     clientInfo: { name: "test-client", version: "0.0.0" },
   },
 };
+
+/** The `name=value` pair from the PKCE Set-Cookie, ready to send back. */
+function pkceCookie(res: Response): string {
+  return res.headers.get("set-cookie")!.split(";")[0]!;
+}
 
 function mcpHeaders(authToken: string, sessionId?: string): Record<string, string> {
   const headers: Record<string, string> = {
@@ -203,6 +208,71 @@ describe("http server", () => {
   });
 });
 
+describe("stateless /mcp", () => {
+  test("answers initialize without issuing a session id", async () => {
+    await withApp(
+      "secret",
+      async (baseUrl) => {
+        const res = await fetch(`${baseUrl}${MCP_PATH}`, {
+          method: "POST",
+          headers: mcpHeaders("secret"),
+          body: JSON.stringify(initBody),
+        });
+        expect(res.status).toBe(200);
+        expect(res.headers.get("mcp-session-id")).toBeNull();
+      },
+      { stateless: true },
+    );
+  });
+
+  test("serves a second client with no prior initialize handshake", async () => {
+    await withApp(
+      "secret",
+      async (baseUrl) => {
+        const res = await fetch(`${baseUrl}${MCP_PATH}`, {
+          method: "POST",
+          headers: mcpHeaders("secret"),
+          body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }),
+        });
+        expect(res.status).not.toBe(400);
+        expect(res.status).not.toBe(401);
+      },
+      { stateless: true },
+    );
+  });
+
+  test("refuses the GET stream and DELETE teardown it cannot honour", async () => {
+    await withApp(
+      "secret",
+      async (baseUrl) => {
+        for (const method of ["GET", "DELETE"]) {
+          const res = await fetch(`${baseUrl}${MCP_PATH}`, {
+            method,
+            headers: mcpHeaders("secret"),
+          });
+          expect(res.status).toBe(405);
+        }
+      },
+      { stateless: true },
+    );
+  });
+
+  test("still requires the bearer secret", async () => {
+    await withApp(
+      "secret",
+      async (baseUrl) => {
+        const res = await fetch(`${baseUrl}${MCP_PATH}`, {
+          method: "POST",
+          headers: { ...mcpHeaders("wrong") },
+          body: JSON.stringify(initBody),
+        });
+        expect(res.status).toBe(401);
+      },
+      { stateless: true },
+    );
+  });
+});
+
 describe("http oauth setup", () => {
   const originalFetch = globalThis.fetch;
   afterEach(() => {
@@ -246,10 +316,47 @@ describe("http oauth setup", () => {
     });
   });
 
+  test("POST /oauth/start sets an HttpOnly PKCE cookie", async () => {
+    await withOAuthApp("secret", async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/oauth/start`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ token: "secret" }),
+        redirect: "manual",
+      });
+      const cookie = res.headers.get("set-cookie")!;
+      expect(cookie).toContain("whoop_mcp_oauth=");
+      expect(cookie).toContain("HttpOnly");
+      expect(cookie).toContain("SameSite=Lax");
+    });
+  });
+
   test("GET /oauth/callback with no pending flow is a 400", async () => {
     await withOAuthApp("secret", async (baseUrl) => {
       const res = await fetch(`${baseUrl}/oauth/callback?code=abc&state=xyz`);
       expect(res.status).toBe(400);
+    });
+  });
+
+  test("GET /oauth/callback rejects a tampered PKCE cookie", async () => {
+    await withOAuthApp("secret", async (baseUrl) => {
+      const start = await fetch(`${baseUrl}/oauth/start`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ token: "secret" }),
+        redirect: "manual",
+      });
+      const state = new URL(start.headers.get("location")!).searchParams.get("state")!;
+      // Flip a byte of the signature: the payload no longer verifies, so the
+      // callback must not treat it as a pending flow.
+      const cookie = pkceCookie(start);
+      const tampered = cookie.slice(0, -1) + (cookie.endsWith("A") ? "B" : "A");
+
+      const res = await fetch(`${baseUrl}/oauth/callback?code=auth-code&state=${state}`, {
+        headers: { Cookie: tampered },
+      });
+      expect(res.status).toBe(400);
+      expect(await res.text()).toContain("Authorization expired");
     });
   });
 
@@ -275,8 +382,11 @@ describe("http oauth setup", () => {
       });
       const authUrl = new URL(start.headers.get("location")!);
       const state = authUrl.searchParams.get("state")!;
+      const pendingCookie = pkceCookie(start);
 
-      const callback = await fetch(`${baseUrl}/oauth/callback?code=auth-code&state=${state}`);
+      const callback = await fetch(`${baseUrl}/oauth/callback?code=auth-code&state=${state}`, {
+        headers: { Cookie: pendingCookie },
+      });
       expect(callback.status).toBe(200);
       expect(await callback.text()).toContain("Whoop connected");
 

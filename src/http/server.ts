@@ -7,6 +7,12 @@
 // Each MCP client session gets its own McpServer + Streamable HTTP
 // transport. Sharing one transport across clients (or reconnects) makes
 // the second initialize fail.
+//
+// In stateless mode the per-session map is skipped entirely: every POST
+// builds a throwaway server+transport and tears it down again. That is the
+// only mode that works on a serverless platform, where consecutive
+// requests from one client land on different instances and an in-memory
+// session map is a promise the deployment cannot keep.
 
 import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
@@ -32,6 +38,11 @@ export interface HttpServerOptions {
   isReady?: () => Promise<boolean>;
   /** Browser OAuth+PKCE setup for Docker/HTTP deploys. */
   oauth?: OAuthSetup;
+  /**
+   * Serve /mcp without server-side sessions: one server+transport per
+   * request, no SSE stream, no mcp-session-id. Required on serverless.
+   */
+  stateless?: boolean;
 }
 
 interface Session {
@@ -87,7 +98,7 @@ async function handleRequest(
       req.method === "GET" &&
       (url.searchParams.has("code") || url.searchParams.has("error") || url.searchParams.has("state"));
     if (isCallback) {
-      await opts.oauth.handleCallback(url, res);
+      await opts.oauth.handleCallback(req, url, res);
       return;
     }
     if (url.pathname === OAUTH_START_PATH && req.method === "POST") {
@@ -121,6 +132,11 @@ async function handleRequest(
   if (opts.isReady && !(await opts.isReady())) {
     res.writeHead(503, { "Content-Type": "text/plain" });
     res.end("whoop-mcp: not connected to Whoop yet; open / in a browser to authorize");
+    return;
+  }
+
+  if (opts.stateless) {
+    await handleStatelessRequest(req, res, createMcpServer);
     return;
   }
 
@@ -160,6 +176,41 @@ async function handleRequest(
 
   res.writeHead(405, { "Content-Type": "text/plain" });
   res.end("method not allowed");
+}
+
+/**
+ * One MCP exchange, start to finish, with no state kept between requests.
+ * GET (the SSE stream) and DELETE (session teardown) have nothing to act
+ * on here, so they are refused rather than silently doing nothing.
+ */
+async function handleStatelessRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  createMcpServer: () => McpServer,
+): Promise<void> {
+  if (req.method !== "POST") {
+    res.writeHead(405, { "Content-Type": "application/json", Allow: "POST" });
+    res.end(jsonRpcError(-32000, "Method not allowed: this endpoint is stateless, use POST"));
+    return;
+  }
+
+  let body: unknown;
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    res.end(jsonRpcError(-32700, "Parse error"));
+    return;
+  }
+
+  const server = createMcpServer();
+  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+  res.on("close", () => {
+    void transport.close();
+    void server.close();
+  });
+  await server.connect(transport);
+  await transport.handleRequest(req, res, body);
 }
 
 async function openSession(

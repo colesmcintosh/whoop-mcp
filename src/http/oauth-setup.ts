@@ -1,15 +1,20 @@
-// Browser-based Whoop OAuth+PKCE for HTTP/Docker deploys. Starting the
-// flow requires MCP_AUTH_TOKEN (form field); the callback is bound to a
-// single in-memory PKCE session so a stolen redirect cannot be exchanged.
+// Browser-based Whoop OAuth+PKCE for HTTP and hosted deploys. Starting the
+// flow requires MCP_AUTH_TOKEN (form field); the callback is bound to the
+// PKCE session carried in a signed, short-lived cookie, so a stolen
+// redirect cannot be exchanged. Keeping that session in the cookie rather
+// than in server memory is what lets the flow survive a serverless deploy,
+// where /oauth/start and the callback need not hit the same instance.
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Config } from "../auth/config.ts";
 import { createAuthRequest, exchangeCode } from "../auth/oauth-client.ts";
 import { saveToken } from "../auth/token-store.ts";
+import { clearCookie, readCookie, serializeCookie, signCookieValue, verifyCookieValue } from "./cookie.ts";
 import { timingSafeEqualStrings } from "./secret.ts";
 
 const PENDING_TTL_MS = 5 * 60 * 1000;
 const FORM_BODY_LIMIT = 8 * 1024;
+const PENDING_COOKIE = "whoop_mcp_oauth";
 
 export const OAUTH_START_PATH = "/oauth/start";
 export const SETUP_PATH = "/setup";
@@ -21,14 +26,24 @@ interface PendingAuth {
 }
 
 export class OAuthSetup {
-  private pending: PendingAuth | null = null;
+  // Declared-and-assigned rather than constructor parameter properties, so
+  // this file parses under type-stripping runtimes. See WhoopClient.
+  private readonly config: Config;
+  private readonly authToken: string;
+  private readonly env: NodeJS.ProcessEnv;
+  private readonly onAuthorized?: () => void;
 
   constructor(
-    private readonly config: Config,
-    private readonly authToken: string,
-    private readonly env: NodeJS.ProcessEnv = process.env,
-    private readonly onAuthorized?: () => void,
-  ) {}
+    config: Config,
+    authToken: string,
+    env: NodeJS.ProcessEnv = process.env,
+    onAuthorized?: () => void,
+  ) {
+    this.config = config;
+    this.authToken = authToken;
+    this.env = env;
+    this.onAuthorized = onAuthorized;
+  }
 
   callbackPath(): string {
     return new URL(this.config.redirectUri).pathname || "/";
@@ -43,14 +58,22 @@ export class OAuthSetup {
     }
 
     const { state, verifier, authUrl } = createAuthRequest(this.config);
-    this.pending = { state, verifier, expiresAt: Date.now() + PENDING_TTL_MS };
-    res.writeHead(302, { Location: authUrl });
+    const pending: PendingAuth = { state, verifier, expiresAt: Date.now() + PENDING_TTL_MS };
+    res.writeHead(302, {
+      Location: authUrl,
+      "Set-Cookie": serializeCookie(
+        PENDING_COOKIE,
+        signCookieValue(JSON.stringify(pending), this.authToken),
+        { maxAgeSeconds: PENDING_TTL_MS / 1000, secure: this.secureCookies() },
+      ),
+    });
     res.end();
   }
 
-  async handleCallback(url: URL, res: ServerResponse): Promise<void> {
-    const pending = this.pending;
-    this.pending = null;
+  async handleCallback(req: IncomingMessage, url: URL, res: ServerResponse): Promise<void> {
+    const pending = this.readPending(req);
+    // The PKCE session is single-use whichever way this request ends.
+    res.setHeader("Set-Cookie", clearCookie(PENDING_COOKIE, { secure: this.secureCookies() }));
 
     const errorParam = url.searchParams.get("error");
     if (errorParam) {
@@ -85,6 +108,22 @@ export class OAuthSetup {
     }
 
     html(res, 200, resultPage("Whoop connected", "You can close this tab. Point your MCP client at /mcp."));
+  }
+
+  private readPending(req: IncomingMessage): PendingAuth | null {
+    const raw = readCookie(req.headers.cookie, PENDING_COOKIE);
+    if (!raw) return null;
+    const payload = verifyCookieValue(raw, this.authToken);
+    if (!payload) return null;
+    try {
+      return JSON.parse(payload) as PendingAuth;
+    } catch {
+      return null;
+    }
+  }
+
+  private secureCookies(): boolean {
+    return this.config.redirectUri.startsWith("https:");
   }
 }
 

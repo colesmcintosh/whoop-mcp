@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/colesmcintosh/whoop-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/colesmcintosh/whoop-mcp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
-[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new/template?template=https://github.com/colesmcintosh/whoop-mcp)
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fcolesmcintosh%2Fwhoop-mcp&env=WHOOP_CLIENT_ID,WHOOP_CLIENT_SECRET,MCP_AUTH_TOKEN&envDescription=Whoop%20app%20credentials%20plus%20a%20bearer%20secret%20for%20%2Fmcp&envLink=https%3A%2F%2Fgithub.com%2Fcolesmcintosh%2Fwhoop-mcp%2Fblob%2Fmain%2FDEPLOY.md&stores=%5B%7B%22type%22%3A%22integration%22%2C%22integrationSlug%22%3A%22upstash%22%2C%22productSlug%22%3A%22redis%22%7D%5D)
 
 A [Model Context Protocol](https://modelcontextprotocol.io) server for the
 [Whoop API v2](https://developer.whoop.com/), written in TypeScript for
@@ -94,8 +94,20 @@ Any MCP client that speaks Streamable HTTP works the same way — URL
 
 On a remote host, set `WHOOP_REDIRECT_URI` to
 `https://<your-host>/oauth/callback` and register that same URL on the Whoop
-app. Railway (including the volume UID the image needs), `docker run`, and
-reconnect/rotate notes are in [DEPLOY.md](./DEPLOY.md).
+app. Vercel, `docker run`, and reconnect/rotate notes are in
+[DEPLOY.md](./DEPLOY.md).
+
+## Deploy on Vercel
+
+`api/index.ts` serves the same app as the container, with two changes the
+platform requires: `/mcp` runs stateless (no server-side session map, so
+`GET /mcp` returns `405`), and the rotating Whoop token is kept in Redis
+rather than on a disk that does not outlive the invocation. Attach an
+Upstash Redis store to the project — the `KV_REST_API_*` variables it
+injects are what switch the token store over — set `WHOOP_CLIENT_ID`,
+`WHOOP_CLIENT_SECRET`, `MCP_AUTH_TOKEN`, and point `WHOOP_REDIRECT_URI` at
+`https://<domain>/oauth/callback`. Full walkthrough in
+[DEPLOY.md](./DEPLOY.md).
 
 ## Local stdio setup
 
@@ -197,16 +209,19 @@ All 11 tools are read-only. List tools accept `limit` (1–25, default 10),
 | `WHOOP_TOKEN_FILE` | no | Override the local token path. Default: platform config dir (see above), or `/data/token.json` in the Docker image. |
 | `PORT` / `MCP_HTTP_ADDR` | no | Set either to run in HTTP mode instead of stdio. `MCP_HTTP_ADDR` wins if both are set (`:8080`, `8080`, or `host:port`). The Docker image sets `PORT=8080`. |
 | `MCP_AUTH_TOKEN` | yes, in HTTP mode | Bearer secret required on every `/mcp` request, and to start the browser setup flow. Startup fails without it. |
-| `WHOOP_REFRESH_TOKEN` | no | Seeds the token store on first boot in HTTP mode (e.g. a fresh volume) if you already authorized locally. Ignored once a token file exists. See [DEPLOY.md](./DEPLOY.md). |
+| `WHOOP_REFRESH_TOKEN` | no | Seeds the token store on first boot in HTTP mode (e.g. a fresh volume) if you already authorized locally. Ignored once a token is stored. See [DEPLOY.md](./DEPLOY.md). |
+| `KV_REST_API_URL` / `KV_REST_API_TOKEN` | no | Redis REST credentials. When present, the rotating token is stored in Redis instead of a file — this is what makes a serverless deploy work. `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` are accepted under the same rules. |
+| `WHOOP_TOKEN_KEY` | no | Redis key holding the token. Default `whoop-mcp:token`. |
 
 ## Layout
 
 ```
+api/          Vercel entry point (stateless /mcp, Redis-backed token store)
 src/cli/      whoop-mcp (stdio/HTTP entry point), whoop-auth (local OAuth bootstrap)
-src/auth/     OAuth+PKCE client, token storage, auto-refreshing token source
+src/auth/     OAuth+PKCE client, token storage (file or Redis), auto-refreshing token source
 src/whoop/    Whoop API v2 HTTP client
 src/mcp/      MCP tool registration
-src/http/     single-tenant HTTP transport (per-session /mcp, /healthz, browser setup)
+src/http/     single-tenant HTTP transport (/mcp, /healthz, browser setup)
 ```
 
 ## Development
@@ -229,7 +244,11 @@ See [SECURITY.md](./SECURITY.md). Briefly:
   password. Startup fails without it.
 - The OAuth flow uses PKCE; `whoop-auth` only accepts a localhost redirect.
 - The token file is written with `0600` permissions and rewritten whenever
-  Whoop rotates the refresh token.
+  Whoop rotates the refresh token. On a Redis-backed deploy the same
+  rotation is written back to the Redis key.
+- The browser setup flow carries its PKCE session in an HMAC-signed,
+  HttpOnly, five-minute cookie, so a tampered or replayed callback cannot be
+  exchanged.
 - A 401 from Whoop triggers one refresh-and-retry before the tool fails.
 
 ## License
