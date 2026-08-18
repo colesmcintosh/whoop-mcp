@@ -51,10 +51,17 @@ function listParamsToSearch(p: ListParams): URLSearchParams {
 }
 
 export class WhoopClient {
-  constructor(
-    private readonly tokenSource: TokenSource,
-    private readonly baseUrl: string = BASE_URL,
-  ) {}
+  // Fields are declared and assigned rather than using constructor
+  // parameter properties: those need a real TypeScript compiler, and this
+  // source is run directly by type-stripping runtimes (Node, and Vercel's
+  // Node functions) that only erase types.
+  private readonly tokenSource: TokenSource;
+  private readonly baseUrl: string;
+
+  constructor(tokenSource: TokenSource, baseUrl: string = BASE_URL) {
+    this.tokenSource = tokenSource;
+    this.baseUrl = baseUrl;
+  }
 
   private async get(path: string, query?: URLSearchParams, retried = false): Promise<string> {
     const qs = query?.toString();

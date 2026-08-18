@@ -1,7 +1,0 @@
-bin/
-.env
-.env.*
-.railway-secrets
-.git/
-*.md
-node_modules/

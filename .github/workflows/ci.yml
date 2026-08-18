@@ -42,6 +42,47 @@ jobs:
       - name: Lint
         run: bun run lint
 
+  vercel-entrypoint:
+    # Vercel's Node.js runtime type-strips the sources rather than compiling
+    # them, which rejects syntax Bun accepts (constructor parameter
+    # properties, most notably). Boot the function entry point under plain
+    # node so that class of breakage fails here, not on deploy.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Boot api/index.ts under node
+        env:
+          WHOOP_CLIENT_ID: ci
+          WHOOP_CLIENT_SECRET: ci
+          MCP_AUTH_TOKEN: ci-secret
+          PORT: "18081"
+        run: |
+          node api/index.ts &
+          trap 'kill %1' EXIT
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:18081/healthz && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:18081/healthz | grep -qx ok
+          curl -fsS http://127.0.0.1:18081/ | grep -q "Connect Whoop"
+          # vercel.json rewrites to the function, but a direct /api hit must
+          # reach the same routes.
+          curl -fsS http://127.0.0.1:18081/api/healthz | grep -qx ok
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18081/mcp)
+          test "$code" = "401"
+
   docker:
     runs-on: ubuntu-latest
     steps:

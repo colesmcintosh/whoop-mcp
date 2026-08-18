@@ -1,9 +1,9 @@
+node_modules/
+dist/
+*.tsbuildinfo
 /bin/
 .env
 .env.local
 *.test
 *.out
-.railway-secrets
-node_modules/
-dist/
-*.tsbuildinfo
+.vercel/

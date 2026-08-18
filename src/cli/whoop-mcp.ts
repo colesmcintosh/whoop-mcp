@@ -12,17 +12,16 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { loadConfigFromEnv } from "../auth/config.ts";
 import { createTokenSource } from "../auth/token-source.ts";
 import { seedFromRefreshTokenIfMissing, tokenExists } from "../auth/token-store.ts";
-import { OAuthSetup } from "../http/oauth-setup.ts";
-import { createHttpApp, parseListenAddr } from "../http/server.ts";
+import { createWhoopHttpApp } from "../http/app.ts";
+import { parseListenAddr } from "../http/server.ts";
 import { createServer } from "../mcp/create-server.ts";
 import { WhoopClient } from "../whoop/client.ts";
 
 async function main(): Promise<void> {
-  const config = loadConfigFromEnv();
-  await seedFromRefreshTokenIfMissing(process.env.WHOOP_REFRESH_TOKEN);
-
   const addr = httpListenAddr();
   if (!addr) {
+    const config = loadConfigFromEnv();
+    await seedFromRefreshTokenIfMissing(process.env.WHOOP_REFRESH_TOKEN);
     if (!(await tokenExists())) {
       throw new Error("no token stored; run whoop-auth first (or set WHOOP_REFRESH_TOKEN)");
     }
@@ -33,18 +32,12 @@ async function main(): Promise<void> {
     return;
   }
 
-  const authToken = process.env.MCP_AUTH_TOKEN;
-  if (!authToken) {
-    throw new Error("MCP_AUTH_TOKEN must be set when running in HTTP mode");
-  }
+  // The app seeds in the background so serverless entry points can build it
+  // synchronously; here there is no such constraint, and seeding first keeps
+  // the "not connected yet" hint below accurate.
+  await seedFromRefreshTokenIfMissing(process.env.WHOOP_REFRESH_TOKEN);
 
-  const tokenSource = createTokenSource(config);
-  const client = new WhoopClient(tokenSource);
-  const app = createHttpApp(() => createServer(client), {
-    authToken,
-    isReady: () => tokenExists(),
-    oauth: new OAuthSetup(config, authToken, process.env, () => tokenSource.reload()),
-  });
+  const app = createWhoopHttpApp();
   const { host, port } = parseListenAddr(addr);
   await new Promise<void>((resolve, reject) => {
     app.once("error", reject);
