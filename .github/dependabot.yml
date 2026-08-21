@@ -9,6 +9,13 @@ updates:
       bun-deps:
         patterns:
           - "*"
+    ignore:
+      # typescript-eslint cannot load the TS 7 compiler API yet, so a TS 7
+      # bump turns `bun run lint` into a hard error. Drop this once
+      # https://github.com/typescript-eslint/typescript-eslint/issues/10940
+      # ships.
+      - dependency-name: typescript
+        update-types: [version-update:semver-major]
 
   - package-ecosystem: github-actions
     directory: /
